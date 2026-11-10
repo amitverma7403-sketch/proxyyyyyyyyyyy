@@ -31,6 +31,9 @@ jobs:
           mv MainActivity.java FrpcService.java BootReceiver.java app/src/main/java/com/nodeconsole/node/
           mv AndroidManifest.xml app/src/main/
           mv app.build.gradle app/build.gradle
+          mkdir -p app/src/main/res/drawable
+          mv ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
+          echo "android.useAndroidX=true" > gradle.properties
 
       - name: Download the official frp client (frpc) for Android CPUs
         run: |

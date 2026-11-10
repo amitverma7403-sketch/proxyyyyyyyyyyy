@@ -31,3 +31,8 @@ android {
         }
     }
 }
+
+dependencies {
+    // QR scanner (camera permission is requested by the library itself)
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+}

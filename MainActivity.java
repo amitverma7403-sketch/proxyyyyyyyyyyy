@@ -1,13 +1,13 @@
 package com.nodeconsole.node;
 
 import android.app.Activity;
-import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -15,9 +15,12 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.text.InputType;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -25,16 +28,30 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.google.zxing.integration.android.IntentIntegrator;
+import com.google.zxing.integration.android.IntentResult;
+
 import org.json.JSONObject;
 
-/** One screen: paste the pairing code from your dashboard, tap Connect. */
+/** Scan the pairing QR from your dashboard (or paste the code), then tap Connect. */
 public class MainActivity extends Activity {
     static final String PREFS = "node";
 
+    // Same palette as the web dashboard
+    private static final int INK = Color.parseColor("#0F1316");
+    private static final int PANEL = Color.parseColor("#151B1F");
+    private static final int RAISE = Color.parseColor("#1B2328");
+    private static final int LINE = Color.parseColor("#263137");
+    private static final int TEXT = Color.parseColor("#E9F0F2");
+    private static final int MUTE = Color.parseColor("#8B9BA3");
+    private static final int TEAL = Color.parseColor("#34D3B0");
+    private static final int TEAL_D = Color.parseColor("#0E2A26");
+    private static final int WARN = Color.parseColor("#F2B84B");
+    private static final int BAD = Color.parseColor("#EF6B6B");
+
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private TextView statusView;
-    private TextView detailView;
-    private TextView warnView;
+    private TextView statusView, detailView, warnView, ipView, netView, pairedView;
+    private View statusDot, warnCard, codeBox;
     private EditText codeInput;
     private Button connectButton;
 
@@ -50,104 +67,247 @@ public class MainActivity extends Activity {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
     }
 
+    private GradientDrawable shape(int fill, int stroke, int radiusDp) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(fill);
+        g.setCornerRadius(dp(radiusDp));
+        if (stroke != 0) {
+            g.setStroke(dp(1), stroke);
+        }
+        return g;
+    }
+
+    private LinearLayout card() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setBackground(shape(PANEL, LINE, 18));
+        c.setPadding(dp(18), dp(16), dp(18), dp(18));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(12);
+        c.setLayoutParams(lp);
+        return c;
+    }
+
+    private TextView text(String s, int size, int color, boolean bold) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextSize(size);
+        t.setTextColor(color);
+        if (bold) {
+            t.setTypeface(Typeface.DEFAULT_BOLD);
+        }
+        return t;
+    }
+
+    private TextView label(String s) {
+        TextView t = text(s.toUpperCase(), 11, MUTE, true);
+        t.setLetterSpacing(0.09f);
+        return t;
+    }
+
+    /** Filled teal, outlined, or outlined-red button. */
+    private Button button(String s, int kind) {
+        Button b = new Button(this);
+        b.setAllCaps(false);
+        b.setText(s);
+        b.setTextSize(15);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setStateListAnimator(null);
+        b.setPadding(dp(16), 0, dp(16), 0);
+        styleButton(b, kind);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
+        lp.topMargin = dp(10);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private void styleButton(Button b, int kind) {
+        if (kind == 0) {            // primary
+            b.setBackground(shape(TEAL, 0, 14));
+            b.setTextColor(Color.parseColor("#05211B"));
+        } else if (kind == 1) {     // secondary
+            b.setBackground(shape(RAISE, LINE, 14));
+            b.setTextColor(TEXT);
+        } else {                    // danger
+            b.setBackground(shape(Color.parseColor("#2A1618"), Color.parseColor("#5A2A2A"), 14));
+            b.setTextColor(BAD);
+        }
+    }
+
+    private LinearLayout tile(String name, TextView value) {
+        LinearLayout t = new LinearLayout(this);
+        t.setOrientation(LinearLayout.VERTICAL);
+        t.setBackground(shape(RAISE, LINE, 14));
+        t.setPadding(dp(14), dp(12), dp(14), dp(12));
+        t.addView(label(name));
+        value.setTextSize(17);
+        value.setTextColor(TEXT);
+        value.setTypeface(Typeface.DEFAULT_BOLD);
+        value.setPadding(0, dp(4), 0, 0);
+        value.setSingleLine(true);
+        t.addView(value);
+        return t;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        int bg = Color.parseColor("#0E1214");
-        int fg = Color.parseColor("#E8EEF0");
-        int mute = Color.parseColor("#8A9AA1");
+        Window w = getWindow();
+        w.setStatusBarColor(INK);
+        w.setNavigationBarColor(INK);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(bg);
-        root.setPadding(dp(20), dp(40), dp(20), dp(24));
+        root.setBackgroundColor(INK);
+        root.setPadding(dp(18), dp(28), dp(18), dp(28));
 
-        TextView title = new TextView(this);
-        title.setText("Node Console");
-        title.setTextColor(fg);
-        title.setTextSize(24);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        root.addView(title);
+        // ---- header
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.VERTICAL);
+        head.addView(text("Node Console", 26, TEXT, true));
+        TextView sub = text("Share this phone's mobile connection with your gateway.", 13, MUTE, false);
+        sub.setPadding(0, dp(2), 0, dp(6));
+        head.addView(sub);
+        root.addView(head);
 
-        statusView = new TextView(this);
-        statusView.setTextSize(18);
-        statusView.setPadding(0, dp(16), 0, dp(4));
-        root.addView(statusView);
+        // ---- status card
+        LinearLayout status = card();
+        LinearLayout statusRow = new LinearLayout(this);
+        statusRow.setOrientation(LinearLayout.HORIZONTAL);
+        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+        statusDot = new View(this);
+        statusDot.setLayoutParams(new LinearLayout.LayoutParams(dp(12), dp(12)));
+        statusRow.addView(statusDot);
+        statusView = text("", 22, TEXT, true);
+        statusView.setPadding(dp(10), 0, 0, 0);
+        statusRow.addView(statusView);
+        status.addView(statusRow);
 
-        detailView = new TextView(this);
-        detailView.setTextColor(mute);
-        detailView.setTextSize(14);
-        root.addView(detailView);
+        detailView = text("", 13, MUTE, false);
+        detailView.setPadding(0, dp(6), 0, dp(12));
+        status.addView(detailView);
 
-        warnView = new TextView(this);
-        warnView.setTextColor(Color.parseColor("#F2B84B"));
-        warnView.setTextSize(14);
-        warnView.setPadding(0, dp(10), 0, 0);
-        root.addView(warnView);
+        LinearLayout tiles = new LinearLayout(this);
+        tiles.setOrientation(LinearLayout.HORIZONTAL);
+        ipView = new TextView(this);
+        netView = new TextView(this);
+        LinearLayout t1 = tile("Public IP", ipView);
+        LinearLayout t2 = tile("Network", netView);
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        half.rightMargin = dp(5);
+        LinearLayout.LayoutParams half2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        half2.leftMargin = dp(5);
+        tiles.addView(t1, half);
+        tiles.addView(t2, half2);
+        status.addView(tiles);
 
-        TextView label = new TextView(this);
-        label.setText("Pairing code (from your dashboard)");
-        label.setTextColor(mute);
-        label.setTextSize(13);
-        label.setPadding(0, dp(24), 0, dp(6));
-        root.addView(label);
-
-        codeInput = new EditText(this);
-        codeInput.setTextColor(fg);
-        codeInput.setHintTextColor(mute);
-        codeInput.setHint("NC1....");
-        codeInput.setTextSize(13);
-        codeInput.setMinLines(3);
-        codeInput.setGravity(Gravity.TOP);
-        codeInput.setBackgroundColor(Color.parseColor("#161C1F"));
-        codeInput.setPadding(dp(12), dp(12), dp(12), dp(12));
-        root.addView(codeInput);
-
-        Button paste = new Button(this);
-        paste.setText("Paste from clipboard");
-        paste.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip().getItemCount() > 0) {
-                    CharSequence t = cm.getPrimaryClip().getItemAt(0).getText();
-                    if (t != null) {
-                        codeInput.setText(t.toString().trim());
-                    }
-                }
-            }
-        });
-        root.addView(paste);
-
-        connectButton = new Button(this);
+        connectButton = button("Connect", 0);
         connectButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 toggle();
             }
         });
-        root.addView(connectButton);
+        status.addView(connectButton);
+        root.addView(status);
 
-        Button battery = new Button(this);
-        battery.setText("Allow running in background");
+        // ---- wi-fi warning
+        warnCard = card();
+        warnCard.setBackground(shape(Color.parseColor("#2B2411"), Color.parseColor("#5B4A1B"), 14));
+        warnView = text("", 13, WARN, false);
+        ((LinearLayout) warnCard).addView(warnView);
+        warnCard.setVisibility(View.GONE);
+        root.addView(warnCard);
+
+        // ---- pairing card
+        LinearLayout pair = card();
+        pair.addView(text("Pair this phone", 17, TEXT, true));
+        pairedView = text("", 13, MUTE, false);
+        pairedView.setPadding(0, dp(2), 0, 0);
+        pair.addView(pairedView);
+
+        Button scan = button("Scan QR code", 0);
+        scan.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                IntentIntegrator ii = new IntentIntegrator(MainActivity.this);
+                ii.setDesiredBarcodeFormats(IntentIntegrator.QR_CODE);
+                ii.setPrompt("Point the camera at the pairing QR in your dashboard");
+                ii.setBeepEnabled(false);
+                ii.setOrientationLocked(false);
+                ii.initiateScan();
+            }
+        });
+        pair.addView(scan);
+
+        Button paste = button("Paste code instead", 1);
+        paste.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                codeBox.setVisibility(View.VISIBLE);
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip().getItemCount() > 0) {
+                    CharSequence t = cm.getPrimaryClip().getItemAt(0).getText();
+                    if (t != null && t.toString().trim().startsWith("NC1.")) {
+                        codeInput.setText(t.toString().trim());
+                    }
+                }
+            }
+        });
+        pair.addView(paste);
+
+        codeBox = new LinearLayout(this);
+        ((LinearLayout) codeBox).setOrientation(LinearLayout.VERTICAL);
+        codeInput = new EditText(this);
+        codeInput.setTextColor(TEXT);
+        codeInput.setHintTextColor(MUTE);
+        codeInput.setHint("NC1....");
+        codeInput.setTextSize(12);
+        codeInput.setTypeface(Typeface.MONOSPACE);
+        codeInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        codeInput.setMinLines(3);
+        codeInput.setGravity(Gravity.TOP);
+        codeInput.setBackground(shape(INK, LINE, 12));
+        codeInput.setPadding(dp(12), dp(12), dp(12), dp(12));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = dp(10);
+        ((LinearLayout) codeBox).addView(codeInput, clp);
+        Button use = button("Use this code", 1);
+        use.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                savePairing(codeInput.getText().toString().trim(), false);
+            }
+        });
+        ((LinearLayout) codeBox).addView(use);
+        codeBox.setVisibility(View.GONE);
+        pair.addView(codeBox);
+        root.addView(pair);
+
+        // ---- keep alive
+        LinearLayout keep = card();
+        keep.addView(text("Keep it running", 17, TEXT, true));
+        TextView tip = text("Turn Wi-Fi off so traffic uses mobile data. Keep the phone charging and let this app run in the background.", 13, MUTE, false);
+        tip.setPadding(0, dp(4), 0, 0);
+        keep.addView(tip);
+        Button battery = button("Allow background running", 1);
         battery.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 askBatteryExemption();
             }
         });
-        root.addView(battery);
-
-        TextView tip = new TextView(this);
-        tip.setText("Tip: turn Wi-Fi off so traffic uses your mobile data. Keep the phone charging and keep this app out of battery-saver lists.");
-        tip.setTextColor(mute);
-        tip.setTextSize(13);
-        tip.setPadding(0, dp(20), 0, 0);
-        root.addView(tip);
+        keep.addView(battery);
+        root.addView(keep);
 
         ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(bg);
+        scroll.setBackgroundColor(INK);
+        scroll.setFillViewport(true);
         scroll.addView(root);
         setContentView(scroll);
 
@@ -159,6 +319,18 @@ public class MainActivity extends Activity {
         if (sp.getString("code", "").length() > 0) {
             codeInput.setText(sp.getString("code", ""));
         }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        IntentResult r = IntentIntegrator.parseActivityResult(requestCode, resultCode, data);
+        if (r != null) {
+            if (r.getContents() != null) {
+                savePairing(r.getContents().trim(), true);
+            }
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
     }
 
     @Override
@@ -177,6 +349,39 @@ public class MainActivity extends Activity {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("enabled", false);
     }
 
+    /** Validate and store a pairing code; optionally connect straight away (after a scan). */
+    private void savePairing(String code, boolean connectNow) {
+        try {
+            JSONObject o = decode(code);
+            String panel = o.getString("p");
+            String token = o.getString("t");
+            boolean was = enabled();
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString("code", code).putString("panel", panel).putString("token", token).apply();
+            codeInput.setText(code);
+            Toast.makeText(this, "Phone paired", Toast.LENGTH_SHORT).show();
+            if (was) {
+                stopService(new Intent(this, FrpcService.class));  // restart with the new pairing
+            }
+            if (connectNow || was) {
+                startTunnel();
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, "That is not a pairing code from your dashboard", Toast.LENGTH_LONG).show();
+        }
+        refresh();
+    }
+
+    private void startTunnel() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("enabled", true).apply();
+        Intent svc = new Intent(this, FrpcService.class);
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(svc);
+        } else {
+            startService(svc);
+        }
+    }
+
     private void toggle() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         if (enabled()) {
@@ -185,23 +390,16 @@ public class MainActivity extends Activity {
             refresh();
             return;
         }
-        String code = codeInput.getText().toString().trim();
-        try {
-            JSONObject o = decode(code);
-            String panel = o.getString("p");
-            String token = o.getString("t");
-            sp.edit().putString("code", code).putString("panel", panel).putString("token", token)
-                    .putBoolean("enabled", true).apply();
-        } catch (Exception e) {
-            Toast.makeText(this, "That pairing code is not valid", Toast.LENGTH_LONG).show();
+        if (sp.getString("token", "").length() == 0) {
+            String typed = codeInput.getText().toString().trim();
+            if (typed.length() == 0) {
+                Toast.makeText(this, "Scan the QR code first", Toast.LENGTH_LONG).show();
+                return;
+            }
+            savePairing(typed, true);
             return;
         }
-        Intent svc = new Intent(this, FrpcService.class);
-        if (Build.VERSION.SDK_INT >= 26) {
-            startForegroundService(svc);
-        } else {
-            startService(svc);
-        }
+        startTunnel();
         refresh();
     }
 
@@ -233,19 +431,30 @@ public class MainActivity extends Activity {
     }
 
     private void refresh() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        boolean paired = sp.getString("token", "").length() > 0;
         boolean on = enabled();
-        connectButton.setText(on ? "Disconnect" : "Connect");
-        String st = on ? FrpcService.status : "Not connected";
-        statusView.setText(st);
         boolean good = on && "Connected".equals(FrpcService.status);
-        statusView.setTextColor(Color.parseColor(good ? "#3ECFB0" : on ? "#F2B84B" : "#8A9AA1"));
+
+        connectButton.setText(on ? "Disconnect" : "Connect");
+        styleButton(connectButton, on ? 2 : 0);
+
+        statusView.setText(on ? FrpcService.status : "Not connected");
+        statusView.setTextColor(good ? TEAL : on ? WARN : TEXT);
+        statusDot.setBackground(shape(good ? TEAL : on ? WARN : MUTE, 0, 6));
+
         if (on) {
-            detailView.setText("Public IP: " + FrpcService.publicIp + "\nNetwork: " + FrpcService.networkType
-                    + (FrpcService.lastLog.length() > 0 ? "\nTunnel: " + FrpcService.lastLog : ""));
+            detailView.setText(FrpcService.lastLog.length() > 0 ? "Tunnel: " + FrpcService.lastLog : "Starting the tunnel...");
         } else {
-            detailView.setText("Paste your pairing code and tap Connect.");
+            detailView.setText(paired ? "Ready. Tap Connect to go online." : "Scan the QR code from your dashboard to get started.");
         }
-        warnView.setText(on && "wifi".equals(FrpcService.networkType)
-                ? "This phone is on Wi-Fi, so traffic exits through Wi-Fi. Turn Wi-Fi off to use mobile data." : "");
+        ipView.setText(on && FrpcService.publicIp != null && FrpcService.publicIp.length() > 0 ? FrpcService.publicIp : "-");
+        netView.setText(on && FrpcService.networkType != null && FrpcService.networkType.length() > 0 ? FrpcService.networkType : "-");
+
+        boolean wifi = on && "wifi".equals(FrpcService.networkType);
+        warnCard.setVisibility(wifi ? View.VISIBLE : View.GONE);
+        warnView.setText("This phone is on Wi-Fi, so traffic exits through Wi-Fi. Turn Wi-Fi off to use mobile data.");
+
+        pairedView.setText(paired ? "Paired. Scan a new code to switch to a different device." : "Scan the QR code shown when you add a device.");
     }
 }

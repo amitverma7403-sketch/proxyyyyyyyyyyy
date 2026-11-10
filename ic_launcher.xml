@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The workflow moves this file to app/src/main/res/drawable/ic_launcher.xml -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#0F1316"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#34D3B0"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M28.3,45.4 A40,40 0 0 1 79.7,45.4" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#34D3B0"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M37.3,56.1 A26,26 0 0 1 70.7,56.1" />
+    <path
+        android:fillColor="#34D3B0"
+        android:pathData="M54,76m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0" />
+</vector>
