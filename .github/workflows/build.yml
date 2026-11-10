@@ -1,0 +1,60 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Arrange project files
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/nodeconsole/node
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
+          mv MainActivity.java FrpcService.java BootReceiver.java app/src/main/java/com/nodeconsole/node/
+          mv AndroidManifest.xml app/src/main/
+          mv app.build.gradle app/build.gradle
+
+      - name: Download the official frp client (frpc) for Android CPUs
+        run: |
+          set -e
+          V=0.70.1
+          for pair in "arm64:arm64-v8a" "arm:armeabi-v7a"; do
+            arch=${pair%%:*}
+            abi=${pair##*:}
+            curl -fsSL -o frp.tgz "https://github.com/fatedier/frp/releases/download/v${V}/frp_${V}_linux_${arch}.tar.gz"
+            tar -xzf frp.tgz
+            cp "frp_${V}_linux_${arch}/frpc" "app/src/main/jniLibs/${abi}/libfrpc.so"
+            rm -rf frp.tgz "frp_${V}_linux_${arch}"
+          done
+          ls -la app/src/main/jniLibs/*
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Name the APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk node-console.apk
+
+      - name: Publish to Releases (direct download link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Node Console build ${{ github.run_number }}
+          files: node-console.apk
