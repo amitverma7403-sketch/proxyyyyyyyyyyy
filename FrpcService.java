@@ -1,4 +1,4 @@
-package com.nodeconsole.node;
+package com.nodemax.app;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -94,7 +94,7 @@ public class FrpcService extends Service {
             stopped = false;
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null && wake == null) {
-                wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nodeconsole:tunnel");
+                wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nodemax:tunnel");
                 wake.setReferenceCounted(false);
             }
             hbSecs = sp.getInt("hb_secs", 20);
@@ -454,7 +454,7 @@ public class FrpcService extends Service {
 
     /** Real internet check: any one of two small requests working is enough. */
     private boolean internetOk() {
-        String[] urls = {"https://connectivitycheck.gstatic.com/generate_204", "http://clients3.google.com/generate_204"};
+        String[] urls = {"https://connectivitycheck.gstatic.com/generate_204", "https://www.google.com/generate_204"};
         for (String u : urls) {
             try {
                 HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
@@ -626,7 +626,7 @@ public class FrpcService extends Service {
                 "https://connectivitycheck.gstatic.com/generate_204",
                 "https://www.cloudflare.com/cdn-cgi/trace",
                 "https://1.1.1.1/cdn-cgi/trace",
-                "http://clients3.google.com/generate_204"};
+                "https://www.gstatic.com/generate_204"};
         final long[] ms = new long[urls.length];
         final String[] err = new String[urls.length];
         Thread[] ts = new Thread[urls.length];
@@ -745,7 +745,7 @@ public class FrpcService extends Service {
         } else {
             b = new Notification.Builder(this);
         }
-        return b.setContentTitle("Node Console")
+        return b.setContentTitle("NodeMax")
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .setOngoing(true)

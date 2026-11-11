@@ -1,4 +1,4 @@
-package com.nodeconsole.node;
+package com.nodemax.app;
 
 import android.Manifest;
 import android.app.Activity;
@@ -287,7 +287,7 @@ public class MainActivity extends Activity {
         // ---- header
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.VERTICAL);
-        head.addView(text("Node Console", 26, TEXT, true));
+        head.addView(text("NodeMax", 26, TEXT, true));
         TextView sub = text("Share this phone's mobile connection with your gateway.", 13, MUTE, false);
         sub.setPadding(0, dp(2), 0, dp(6));
         head.addView(sub);
@@ -305,7 +305,7 @@ public class MainActivity extends Activity {
         copyCrash.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                copyText("Node Console crash", diagnostics());
+                copyText("NodeMax crash", diagnostics());
             }
         });
         ((LinearLayout) crashCard).addView(copyCrash);
@@ -467,7 +467,7 @@ public class MainActivity extends Activity {
         copyDiag.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                copyText("Node Console diagnostics", diagnostics());
+                copyText("NodeMax diagnostics", diagnostics());
             }
         });
         diag.addView(copyDiag);
@@ -540,7 +540,7 @@ public class MainActivity extends Activity {
             return;
         }
         Uri u = in.getData();
-        if ("nodeconsole".equals(u.getScheme()) && u.getQueryParameter("c") != null) {
+        if (("nodemax".equals(u.getScheme()) || "nodeconsole".equals(u.getScheme())) && u.getQueryParameter("c") != null) {
             in.setData(null);
             confirmPairing(u.getQueryParameter("c"), true);
         }
@@ -607,7 +607,7 @@ public class MainActivity extends Activity {
         String host;
         try {
             String c = code;
-            if (c.startsWith("nodeconsole://")) {
+            if (c.startsWith("nodemax://") || c.startsWith("nodeconsole://")) {
                 c = Uri.parse(c).getQueryParameter("c");
             }
             Uri pu = Uri.parse(decode(c).getString("p"));
@@ -643,7 +643,7 @@ public class MainActivity extends Activity {
     private String diagnostics() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         StringBuilder b = new StringBuilder();
-        b.append("Node Console ").append(appVersion(this)).append("\n");
+        b.append("NodeMax ").append(appVersion(this)).append("\n");
         b.append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append(", Android ")
                 .append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
         b.append("CPU: ").append(java.util.Arrays.toString(Build.SUPPORTED_ABIS)).append("\n");
@@ -681,7 +681,7 @@ public class MainActivity extends Activity {
     /** Validate and store a pairing code; optionally connect straight away (after a scan). */
     private void savePairing(String code, boolean connectNow) {
         try {
-            if (code.startsWith("nodeconsole://")) {
+            if (code.startsWith("nodemax://") || code.startsWith("nodeconsole://")) {
                 code = Uri.parse(code).getQueryParameter("c");
             }
             JSONObject o = decode(code);

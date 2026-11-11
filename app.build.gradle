@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace 'com.nodeconsole.node'
+    namespace 'com.nodemax.app'
     compileSdk 34
 
     defaultConfig {
-        applicationId 'com.nodeconsole.node'
+        applicationId 'com.nodemax.app'
         minSdk 24
         targetSdk 34
         versionCode 1
@@ -18,10 +18,28 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            // one fixed signing key: phones and Play Protect trust an app that is always signed the same way
+            storeFile file(System.getenv('KS_FILE') ?: 'nodemax.jks')
+            storePassword System.getenv('KS_PASS') ?: ''
+            keyAlias 'nodemax'
+            keyPassword System.getenv('KS_PASS') ?: ''
+            enableV1Signing true
+            enableV2Signing true
+            enableV3Signing true
+        }
+    }
+
     buildTypes {
         debug {
+            debuggable = false
+        }
+        release {
             // not debuggable: nobody can read the pairing token out of the app with adb
             debuggable = false
+            minifyEnabled false  // obfuscated code is a common reason for scanners to flag an app
+            signingConfig signingConfigs.release
         }
     }
 

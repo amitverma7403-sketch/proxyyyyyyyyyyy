@@ -26,15 +26,16 @@ jobs:
       - name: Arrange project files
         run: |
           set -e
-          mkdir -p app/src/main/java/com/nodeconsole/node
+          mkdir -p app/src/main/java/com/nodemax/app app/src/main/res/xml
           mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
-          mv MainActivity.java FrpcService.java BootReceiver.java app/src/main/java/com/nodeconsole/node/
+          mv MainActivity.java FrpcService.java BootReceiver.java app/src/main/java/com/nodemax/app/
+          mv network_security_config.xml data_extraction_rules.xml app/src/main/res/xml/
           mv AndroidManifest.xml app/src/main/
           mv app.build.gradle app/build.gradle
           mkdir -p app/src/main/res/drawable
           mv ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
           echo "android.useAndroidX=true" > gradle.properties
-          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '1.${{ github.run_number }}'/" app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '1.6'/" app/build.gradle
           grep -n "version" app/build.gradle
 
       - name: Download the official frp client (frpc) for Android CPUs
@@ -51,15 +52,36 @@ jobs:
           done
           ls -la app/src/main/jniLibs/*
 
-      - name: Build APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Signing key
+        env:
+          KS_B64: ${{ secrets.KS_B64 }}
+          KS_PASS_SECRET: ${{ secrets.KS_PASS }}
+        run: |
+          set -e
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS_SECRET" ]; then
+            echo "$KS_B64" | base64 -d > app/nodemax.jks
+            echo "KS_PASS=$KS_PASS_SECRET" >> "$GITHUB_ENV"
+            echo "Using your permanent NodeMax signing key"
+          else
+            P=$(openssl rand -hex 16)
+            keytool -genkeypair -keystore app/nodemax.jks -alias nodemax -keyalg RSA -keysize 4096 -validity 36500 \
+              -storepass "$P" -keypass "$P" -dname "CN=NodeMax, O=NodeMax, C=IN"
+            echo "KS_PASS=$P" >> "$GITHUB_ENV"
+            echo "::warning::KS_B64 and KS_PASS secrets are not set, so this build is signed with a throwaway key and cannot update an older install."
+          fi
+          echo "KS_FILE=nodemax.jks" >> "$GITHUB_ENV"
+
+      - name: Build signed APK
+        run: |
+          gradle assembleRelease --no-daemon --stacktrace
+          "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
 
       - name: Name the APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk node-console.apk
+        run: cp app/build/outputs/apk/release/app-release.apk NodeMax.apk
 
       - name: Publish to Releases (direct download link)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Node Console build ${{ github.run_number }}
-          files: node-console.apk
+          name: NodeMax 1.6 build ${{ github.run_number }}
+          files: NodeMax.apk
