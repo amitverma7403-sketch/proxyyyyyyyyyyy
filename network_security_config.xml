@@ -1,14 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <!-- HTTPS only, and only certificates the system trusts. No user-installed CAs, so a proxy tool
-         on the phone cannot read the pairing token. The one exception is the VPS address itself,
-         for panels that have not been moved to the nodemax subdomain yet. -->
+         on the phone cannot read the pairing token. -->
     <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">212.47.76.125</domain>
-    </domain-config>
 </network-security-config>

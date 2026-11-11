@@ -611,6 +611,10 @@ public class MainActivity extends Activity {
                 c = Uri.parse(c).getQueryParameter("c");
             }
             Uri pu = Uri.parse(decode(c).getString("p"));
+            if (!"https".equals(pu.getScheme())) {
+                Toast.makeText(this, "This pairing code uses an unencrypted address. Create a new one in the dashboard.", Toast.LENGTH_LONG).show();
+                return;
+            }
             host = pu.getHost() + (pu.getPort() > 0 ? ":" + pu.getPort() : "");
         } catch (Exception e) {
             Toast.makeText(this, "That is not a pairing code from your dashboard", Toast.LENGTH_LONG).show();
