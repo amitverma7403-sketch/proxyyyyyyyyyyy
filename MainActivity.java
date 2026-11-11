@@ -1,10 +1,12 @@
 package com.nodeconsole.node;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -13,6 +15,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.InputType;
@@ -28,8 +31,9 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.google.zxing.integration.android.IntentIntegrator;
-import com.google.zxing.integration.android.IntentResult;
+import com.google.mlkit.vision.barcode.common.Barcode;
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions;
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning;
 
 import org.json.JSONObject;
 
@@ -38,14 +42,14 @@ public class MainActivity extends Activity {
     static final String PREFS = "node";
 
     // Same palette as the web dashboard
-    private static final int INK = Color.parseColor("#0F1316");
-    private static final int PANEL = Color.parseColor("#151B1F");
-    private static final int RAISE = Color.parseColor("#1B2328");
-    private static final int LINE = Color.parseColor("#263137");
-    private static final int TEXT = Color.parseColor("#E9F0F2");
-    private static final int MUTE = Color.parseColor("#8B9BA3");
-    private static final int TEAL = Color.parseColor("#34D3B0");
-    private static final int TEAL_D = Color.parseColor("#0E2A26");
+    private static final int INK = Color.parseColor("#0A0D0F");
+    private static final int PANEL = Color.parseColor("#0E1316");
+    private static final int RAISE = Color.parseColor("#131A1F");
+    private static final int LINE = Color.parseColor("#1C2529");
+    private static final int TEXT = Color.parseColor("#E6EEF1");
+    private static final int MUTE = Color.parseColor("#8A9AA3");
+    private static final int TEAL = Color.parseColor("#46D3FF");
+    private static final int TEAL_D = Color.parseColor("#0D2A35");
     private static final int WARN = Color.parseColor("#F2B84B");
     private static final int BAD = Color.parseColor("#EF6B6B");
 
@@ -126,7 +130,7 @@ public class MainActivity extends Activity {
     private void styleButton(Button b, int kind) {
         if (kind == 0) {            // primary
             b.setBackground(shape(TEAL, 0, 14));
-            b.setTextColor(Color.parseColor("#05211B"));
+            b.setTextColor(Color.parseColor("#04212B"));
         } else if (kind == 1) {     // secondary
             b.setBackground(shape(RAISE, LINE, 14));
             b.setTextColor(TEXT);
@@ -233,15 +237,23 @@ public class MainActivity extends Activity {
         scan.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                IntentIntegrator ii = new IntentIntegrator(MainActivity.this);
-                ii.setDesiredBarcodeFormats(IntentIntegrator.QR_CODE);
-                ii.setPrompt("Point the camera at the pairing QR in your dashboard");
-                ii.setBeepEnabled(false);
-                ii.setOrientationLocked(false);
-                ii.initiateScan();
+                if (!has(Manifest.permission.CAMERA) && Build.VERSION.SDK_INT >= 23) {
+                    requestPermissions(new String[]{Manifest.permission.CAMERA}, 2);
+                } else {
+                    scanQr();
+                }
             }
         });
         pair.addView(scan);
+
+        Button cam = button("Scan with the camera app", 1);
+        cam.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openCameraApp();
+            }
+        });
+        pair.addView(cam);
 
         Button paste = button("Paste code instead", 1);
         paste.setOnClickListener(new View.OnClickListener() {
@@ -311,26 +323,107 @@ public class MainActivity extends Activity {
         scroll.addView(root);
         setContentView(scroll);
 
-        if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
-        }
+        askAllPermissions();
 
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         if (sp.getString("code", "").length() > 0) {
             codeInput.setText(sp.getString("code", ""));
         }
+        handleIntent(getIntent());
+    }
+
+    private boolean has(String perm) {
+        return Build.VERSION.SDK_INT < 23 || checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Camera (for scanning) and notifications, then the battery exemption that keeps the tunnel alive. */
+    private void askAllPermissions() {
+        java.util.ArrayList<String> need = new java.util.ArrayList<String>();
+        if (!has(Manifest.permission.CAMERA)) {
+            need.add(Manifest.permission.CAMERA);
+        }
+        if (Build.VERSION.SDK_INT >= 33 && !has("android.permission.POST_NOTIFICATIONS")) {
+            need.add("android.permission.POST_NOTIFICATIONS");
+        }
+        if (Build.VERSION.SDK_INT >= 23 && !need.isEmpty()) {
+            requestPermissions(need.toArray(new String[0]), 1);
+        } else {
+            askBatteryOnce();
+        }
+    }
+
+    private void askBatteryOnce() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (!sp.getBoolean("asked_battery", false)) {
+            sp.edit().putBoolean("asked_battery", true).apply();
+            askBatteryExemption();
+        }
     }
 
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        IntentResult r = IntentIntegrator.parseActivityResult(requestCode, resultCode, data);
-        if (r != null) {
-            if (r.getContents() != null) {
-                savePairing(r.getContents().trim(), true);
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == 2) {  // tapped Scan without camera permission
+            if (has(Manifest.permission.CAMERA)) {
+                scanQr();
+            } else {
+                Toast.makeText(this, "Camera permission is off. Use the camera app or paste the code instead.", Toast.LENGTH_LONG).show();
             }
+        } else {
+            askBatteryOnce();
+        }
+    }
+
+    /** Open the phone's own camera: scanning the dashboard QR there opens this app by itself. */
+    private void openCameraApp() {
+        try {
+            startActivity(new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA));
+            Toast.makeText(this, "Point the camera at the QR, then tap the link that appears", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "No camera app found. Paste the code instead.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void handleIntent(Intent in) {
+        if (in == null || in.getData() == null) {
             return;
         }
-        super.onActivityResult(requestCode, resultCode, data);
+        Uri u = in.getData();
+        if ("nodeconsole".equals(u.getScheme()) && u.getQueryParameter("c") != null) {
+            in.setData(null);
+            savePairing(u.getQueryParameter("c"), true);
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent in) {
+        super.onNewIntent(in);
+        setIntent(in);
+        handleIntent(in);
+    }
+
+    /** Google's code scanner runs inside Play Services: no camera permission or extra screen of ours. */
+    private void scanQr() {
+        try {
+            GmsBarcodeScannerOptions opts = new GmsBarcodeScannerOptions.Builder()
+                    .setBarcodeFormats(Barcode.FORMAT_QR_CODE).build();
+            GmsBarcodeScanning.getClient(this, opts).startScan()
+                    .addOnSuccessListener(barcode -> {
+                        String v = barcode.getRawValue();
+                        if (v != null) {
+                            savePairing(v.trim(), true);
+                        }
+                    })
+                    .addOnFailureListener(e -> scannerUnavailable(e));
+        } catch (Throwable t) {
+            scannerUnavailable(t);
+        }
+    }
+
+    private void scannerUnavailable(Throwable e) {
+        codeBox.setVisibility(View.VISIBLE);
+        String why = e == null || e.getMessage() == null ? "" : " (" + e.getMessage() + ")";
+        Toast.makeText(this, "Scanner failed" + why + ". Use the camera app or paste the code.", Toast.LENGTH_LONG).show();
     }
 
     @Override
@@ -345,6 +438,14 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
+    private boolean mobileDataOn() {
+        try {
+            return Settings.Global.getInt(getContentResolver(), "mobile_data", 1) == 1;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
     private boolean enabled() {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("enabled", false);
     }
@@ -352,6 +453,9 @@ public class MainActivity extends Activity {
     /** Validate and store a pairing code; optionally connect straight away (after a scan). */
     private void savePairing(String code, boolean connectNow) {
         try {
+            if (code.startsWith("nodeconsole://")) {
+                code = Uri.parse(code).getQueryParameter("c");
+            }
             JSONObject o = decode(code);
             String panel = o.getString("p");
             String token = o.getString("t");
@@ -444,7 +548,9 @@ public class MainActivity extends Activity {
         statusDot.setBackground(shape(good ? TEAL : on ? WARN : MUTE, 0, 6));
 
         if (on) {
-            detailView.setText(FrpcService.lastLog.length() > 0 ? "Tunnel: " + FrpcService.lastLog : "Starting the tunnel...");
+            detailView.setText((FrpcService.lastLog.length() > 0 ? "Tunnel: " + FrpcService.lastLog : "Starting the tunnel...")
+                    + "\nRoot: " + (FrpcService.rooted ? "yes, remote IP rotation and data control are on"
+                    : "no, remote IP rotation and data control are off"));
         } else {
             detailView.setText(paired ? "Ready. Tap Connect to go online." : "Scan the QR code from your dashboard to get started.");
         }
@@ -452,8 +558,10 @@ public class MainActivity extends Activity {
         netView.setText(on && FrpcService.networkType != null && FrpcService.networkType.length() > 0 ? FrpcService.networkType : "-");
 
         boolean wifi = on && "wifi".equals(FrpcService.networkType);
-        warnCard.setVisibility(wifi ? View.VISIBLE : View.GONE);
-        warnView.setText("This phone is on Wi-Fi, so traffic exits through Wi-Fi. Turn Wi-Fi off to use mobile data.");
+        boolean dataOff = on && !mobileDataOn();
+        warnCard.setVisibility(wifi || dataOff ? View.VISIBLE : View.GONE);
+        warnView.setText(dataOff ? "Mobile data is off, so this phone cannot carry traffic. Turn it on in Settings."
+                : "This phone is on Wi-Fi, so traffic exits through Wi-Fi. Turn Wi-Fi off to use mobile data.");
 
         pairedView.setText(paired ? "Paired. Scan a new code to switch to a different device." : "Scan the QR code shown when you add a device.");
     }

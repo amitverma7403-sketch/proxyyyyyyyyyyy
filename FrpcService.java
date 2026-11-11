@@ -4,15 +4,19 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
 import android.net.NetworkCapabilities;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.provider.Settings;
 import android.telephony.TelephonyManager;
 
 import org.json.JSONArray;
@@ -32,17 +36,23 @@ import java.net.URL;
  * Keeps this phone connected to your panel:
  * - heartbeat every 15s (public IP, carrier, network type)
  * - downloads this device's frpc config and keeps the bundled frpc running
- * - handles "rotate" commands (needs root for now)
+ * - handles "rotate", "data_off" and "data_on" commands (need root for now)
+ * - reports battery level and whether mobile data is on
+ * - watchdog: if mobile data stays off for a few minutes, switches it back on
  */
 public class FrpcService extends Service {
     static volatile String status = "Stopped";
     static volatile String publicIp = "-";
     static volatile String networkType = "-";
     static volatile String lastLog = "";
+    static volatile boolean rooted = false;
+    private static long rootCheckedAt = 0;
 
     private static final String CHANNEL = "node";
     private volatile boolean stopped = false;
     private Thread worker;
+    private Thread watchdog;
+    private boolean alerted = false;
     private Process frpc;
     private String cfgHash = "";
     private PowerManager.WakeLock wake;
@@ -76,6 +86,15 @@ public class FrpcService extends Service {
             }, "node-loop");
             worker.start();
         }
+        if (watchdog == null || !watchdog.isAlive()) {
+            watchdog = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    watchLoop();
+                }
+            }, "node-watchdog");
+            watchdog.start();
+        }
         return START_STICKY;
     }
 
@@ -84,6 +103,9 @@ public class FrpcService extends Service {
         stopped = true;
         if (worker != null) {
             worker.interrupt();
+        }
+        if (watchdog != null) {
+            watchdog.interrupt();
         }
         stopFrpc();
         if (wake != null && wake.isHeld()) {
@@ -108,11 +130,17 @@ public class FrpcService extends Service {
                     startFrpc(panel, token);
                     cfgHash = hash;
                 }
+                sp.edit().putInt("auto_on_min", hb.optInt("auto_on_min", 5)).apply();
                 JSONArray cmds = hb.getJSONArray("commands");
                 for (int i = 0; i < cmds.length(); i++) {
                     JSONObject c = cmds.getJSONObject(i);
-                    if ("rotate".equals(c.getString("op"))) {
+                    String op = c.getString("op");
+                    if ("rotate".equals(op)) {
                         rotate(panel, token, c.getInt("id"));
+                    } else if ("data_off".equals(op)) {
+                        dataOff(panel, token, c.getInt("id"), c.optString("arg", "5"));
+                    } else if ("data_on".equals(op)) {
+                        dataOn(panel, token, c.getInt("id"));
                     }
                 }
                 status = frpcAlive() ? "Connected" : "Tunnel program not running";
@@ -191,6 +219,10 @@ public class FrpcService extends Service {
         boolean ok = false;
         String result;
         String now = old;
+        if (!hasRoot()) {
+            sendAck(panel, token, id, false, "IP rotation needs root on this phone", old);
+            return;
+        }
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "svc data disable; sleep 4; svc data enable"});
             int rc = p.waitFor();
@@ -214,13 +246,19 @@ public class FrpcService extends Service {
             }
             result = old + " -> " + now;
         }
+        sendAck(panel, token, id, ok, result, now);
+    }
+
+    private void sendAck(String panel, String token, int id, boolean ok, String result, String ip) {
         for (int i = 0; i < 15 && !stopped; i++) {
             try {
                 JSONObject body = new JSONObject();
                 body.put("id", id);
                 body.put("ok", ok);
                 body.put("result", result);
-                body.put("ip", now);
+                if (ip != null) {
+                    body.put("ip", ip);
+                }
                 http("POST", panel + "/agent/ack", token, body.toString());
                 return;
             } catch (Exception e) {
@@ -231,6 +269,142 @@ public class FrpcService extends Service {
                 }
             }
         }
+    }
+
+    // ----------------------------------------------------- mobile data on/off
+    /** True when this phone grants root. A "no" is re-checked every 5 minutes (root managers can be slow to prompt). */
+    static boolean hasRoot() {
+        if (rooted) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (rootCheckedAt != 0 && now - rootCheckedAt < 300000L) {
+            return false;
+        }
+        rootCheckedAt = now;
+        final int[] rc = {-1};
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                rc[0] = su("id");
+            }
+        });
+        t.start();
+        try {
+            t.join(6000);
+        } catch (InterruptedException ignored) {
+        }
+        rooted = rc[0] == 0;
+        return rooted;
+    }
+
+    private static int su(String cmd) {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            return p.waitFor();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private boolean mobileDataOn() {
+        try {
+            return Settings.Global.getInt(getContentResolver(), "mobile_data", 1) == 1;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /** Panel asked for data off. Answer first (the link dies right after), then switch it off. */
+    private void dataOff(String panel, String token, int id, String arg) {
+        int mins = 5;
+        try {
+            mins = Math.max(1, Math.min(60, Integer.parseInt(arg)));
+        } catch (Exception ignored) {
+        }
+        if (!hasRoot()) {
+            sendAck(panel, token, id, false, "mobile data control needs root on this phone", null);
+            return;
+        }
+        SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        sp.edit().putLong("auto_on_at", System.currentTimeMillis() + mins * 60000L).apply();
+        alerted = false;
+        sendAck(panel, token, id, true, "data off for " + mins + " min", null);
+        su("svc data disable");
+    }
+
+    private void dataOn(String panel, String token, int id) {
+        boolean ok = su("svc data enable") == 0;
+        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit().putLong("auto_on_at", 0).apply();
+        sendAck(panel, token, id, ok, ok ? "data on" : "mobile data control needs root on this phone", null);
+    }
+
+    /**
+     * Runs on its own thread because the panel cannot be reached while data is off.
+     * Whenever mobile data is off (from the panel or by hand) it is switched back on after a few minutes.
+     */
+    private void watchLoop() {
+        SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        while (!stopped) {
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                return;
+            }
+            try {
+                int mins = sp.getInt("auto_on_min", 5);
+                long at = sp.getLong("auto_on_at", 0);
+                long now = System.currentTimeMillis();
+                if (mobileDataOn()) {
+                    if (at != 0) {
+                        sp.edit().putLong("auto_on_at", 0).apply();
+                    }
+                    alerted = false;
+                    continue;
+                }
+                if (mins <= 0) {
+                    continue;
+                }
+                if (at == 0) {  // turned off by hand: start the countdown
+                    at = now + mins * 60000L;
+                    sp.edit().putLong("auto_on_at", at).apply();
+                }
+                if (now >= at) {
+                    if (su("svc data enable") == 0) {
+                        sp.edit().putLong("auto_on_at", 0).apply();
+                    } else {
+                        sp.edit().putLong("auto_on_at", now + 60000L).apply();  // try again in a minute
+                        if (!alerted) {
+                            alerted = true;
+                            alertDataOff();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void alertDataOff() {
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) {
+            return;
+        }
+        PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(Settings.ACTION_WIRELESS_SETTINGS),
+                PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(new NotificationChannel("alert", "Needs attention", NotificationManager.IMPORTANCE_HIGH));
+            b = new Notification.Builder(this, "alert");
+        } else {
+            b = new Notification.Builder(this);
+        }
+        nm.notify(2, b.setContentTitle("Mobile data is off")
+                .setContentText("This phone is offline. Tap to turn mobile data back on.")
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .build());
     }
 
     // ----------------------------------------------------------------- info
@@ -251,6 +425,18 @@ public class FrpcService extends Service {
         o.put("carrier", carrier);
         networkType = detectNetworkType();
         o.put("network_type", networkType);
+        Intent bat = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (bat != null) {
+            int level = bat.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            int scale = bat.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+            if (level >= 0 && scale > 0) {
+                o.put("battery", level * 100 / scale);
+            }
+            int st = bat.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+            o.put("charging", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
+        }
+        o.put("data_enabled", mobileDataOn());
+        o.put("can_control", hasRoot());
         return o;
     }
 
