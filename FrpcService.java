@@ -50,6 +50,11 @@ public class FrpcService extends Service {
     static volatile boolean rooted = false;
     static volatile String selfTest = "";      // shown in the app, e.g. "5/5 OK, 310 ms"
     static volatile String selfTestJson = null;  // sent with the next heartbeat
+    static volatile int hbSecs = 20;              // heartbeat interval, set by the panel's power mode
+    static volatile int selfSecs = 300;           // how often the phone tests its own internet
+    static volatile String wakeMode = "charging"; // always | charging | never
+    static volatile boolean chargingNow = false;
+    static volatile boolean netOk = true;         // last known real internet state
     private static String cachedIp = null;
     private static long cachedIpAt = 0;
     private static long rootCheckedAt = 0;
@@ -60,6 +65,7 @@ public class FrpcService extends Service {
     private Thread watchdog;
     private Thread tester;
     private boolean alerted = false;
+    private int strikes = 0;
     private Process frpc;
     private String cfgHash = "";
     private PowerManager.WakeLock wake;
@@ -89,8 +95,12 @@ public class FrpcService extends Service {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null && wake == null) {
                 wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nodeconsole:tunnel");
-                wake.acquire();
+                wake.setReferenceCounted(false);
             }
+            hbSecs = sp.getInt("hb_secs", 20);
+            selfSecs = sp.getInt("selftest_secs", 300);
+            wakeMode = sp.getString("wake", "charging");
+            applyWake();
             worker = new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -141,6 +151,19 @@ public class FrpcService extends Service {
         super.onDestroy();
     }
 
+    /** The wake lock keeps the CPU awake with the screen off. It costs battery, so it follows the power mode. */
+    private synchronized void applyWake() {
+        if (wake == null) {
+            return;
+        }
+        boolean want = "always".equals(wakeMode) || ("charging".equals(wakeMode) && chargingNow);
+        if (want && !wake.isHeld()) {
+            wake.acquire();
+        } else if (!want && wake.isHeld()) {
+            wake.release();
+        }
+    }
+
     // ------------------------------------------------------------ main loop
     private void loop() {
         SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
@@ -156,7 +179,12 @@ public class FrpcService extends Service {
                     cfgHash = hash;
                 }
                 MainActivity.markCrashSent(this);  // the panel has the crash report now
-                sp.edit().putInt("auto_on_min", hb.optInt("auto_on_min", 5)).apply();
+                hbSecs = Math.max(10, Math.min(120, hb.optInt("hb_secs", hbSecs)));
+                selfSecs = Math.max(60, Math.min(3600, hb.optInt("selftest_secs", selfSecs)));
+                wakeMode = hb.optString("wake", wakeMode);
+                sp.edit().putInt("auto_on_min", hb.optInt("auto_on_min", 5)).putInt("hb_secs", hbSecs)
+                        .putInt("selftest_secs", selfSecs).putString("wake", wakeMode).apply();
+                applyWake();
                 JSONArray cmds = hb.getJSONArray("commands");
                 for (int i = 0; i < cmds.length(); i++) {
                     JSONObject c = cmds.getJSONObject(i);
@@ -176,7 +204,7 @@ public class FrpcService extends Service {
                 MainActivity.note(this, "heartbeat: " + e);
                 updateNotification(status);
             }
-            for (int i = 0; i < 15 && !stopped; i++) {
+            for (int i = 0; i < hbSecs && !stopped; i++) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException e) {
@@ -374,9 +402,10 @@ public class FrpcService extends Service {
      */
     private void watchLoop() {
         SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        long tick = 30000L;
         while (!stopped) {
             try {
-                Thread.sleep(10000);
+                Thread.sleep(tick);
             } catch (InterruptedException e) {
                 return;
             }
@@ -384,26 +413,35 @@ public class FrpcService extends Service {
                 int mins = sp.getInt("auto_on_min", 5);
                 long at = sp.getLong("auto_on_at", 0);
                 long now = System.currentTimeMillis();
-                if (mobileDataOn()) {
+                tick = at != 0 ? 15000L : 30000L;  // look more often only while a countdown runs
+                if (mobileDataOn() || internetOk()) {
+                    // The data switch can read "off" on phones that still have internet (no root, vendor quirks),
+                    // so a working connection always wins. This costs no network traffic while the switch says on.
+                    netOk = true;
                     if (at != 0) {
                         sp.edit().putLong("auto_on_at", 0).apply();
                     }
                     alerted = false;
+                    strikes = 0;
                     continue;
                 }
+                netOk = false;
                 if (mins <= 0) {
                     continue;
                 }
-                if (at == 0) {  // turned off by hand: start the countdown
-                    at = now + mins * 60000L;
+                if (at == 0) {  // really offline with data off: start the countdown
+                    // No root means nothing can be switched on here, so only wait 60 s and check once more.
+                    at = now + (hasRoot() ? mins * 60000L : 60000L);
                     sp.edit().putLong("auto_on_at", at).apply();
                 }
                 if (now >= at) {
-                    if (su("svc data enable") == 0) {
+                    if (hasRoot() && su("svc data enable") == 0) {
                         sp.edit().putLong("auto_on_at", 0).apply();
+                        strikes = 0;
                     } else {
-                        sp.edit().putLong("auto_on_at", now + 60000L).apply();  // try again in a minute
-                        if (!alerted) {
+                        strikes++;
+                        sp.edit().putLong("auto_on_at", now + 60000L).apply();  // check again in a minute
+                        if (strikes >= 2 && !alerted) {  // tell the person only if it failed twice in a row
                             alerted = true;
                             alertDataOff();
                         }
@@ -412,6 +450,27 @@ public class FrpcService extends Service {
             } catch (Exception ignored) {
             }
         }
+    }
+
+    /** Real internet check: any one of two small requests working is enough. */
+    private boolean internetOk() {
+        String[] urls = {"https://connectivitycheck.gstatic.com/generate_204", "http://clients3.google.com/generate_204"};
+        for (String u : urls) {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                c.setConnectTimeout(5000);
+                c.setReadTimeout(5000);
+                c.setUseCaches(false);
+                c.setInstanceFollowRedirects(false);
+                int code = c.getResponseCode();
+                c.disconnect();
+                if (code >= 200 && code < 400) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
     }
 
     private void alertDataOff() {
@@ -428,8 +487,8 @@ public class FrpcService extends Service {
         } else {
             b = new Notification.Builder(this);
         }
-        nm.notify(2, b.setContentTitle("Mobile data is off")
-                .setContentText("This phone is offline. Tap to turn mobile data back on.")
+        nm.notify(2, b.setContentTitle("No internet on this phone")
+                .setContentText("Mobile data looks off and the phone could not fix it twice. Tap to turn it on.")
                 .setSmallIcon(android.R.drawable.stat_notify_error)
                 .setContentIntent(pi)
                 .setAutoCancel(true)
@@ -440,7 +499,7 @@ public class FrpcService extends Service {
     private JSONObject info() throws Exception {
         JSONObject o = new JSONObject();
         long nowMs = System.currentTimeMillis();
-        if (cachedIp == null || nowMs - cachedIpAt > 45000L) {  // one lookup per 45 s keeps heartbeats quick
+        if (cachedIp == null || nowMs - cachedIpAt > 120000L) {  // one lookup per 2 minutes: fewer radio wake-ups
             String fresh = fetchPublicIp();
             if (fresh != null) {
                 cachedIp = fresh;
@@ -480,7 +539,8 @@ public class FrpcService extends Service {
                     pct = level * 100 / scale;
                 }
                 int st = bat.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-                o.put("charging", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
+                chargingNow = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+                o.put("charging", chargingNow);
             }
         } catch (Exception e) {
             MainActivity.note(this, "battery intent: " + e);
@@ -501,7 +561,7 @@ public class FrpcService extends Service {
         if (pct >= 0) {
             o.put("battery", pct);
         }
-        o.put("data_enabled", mobileDataOn());
+        o.put("data_enabled", mobileDataOn() || netOk);  // the setting is unreliable on some phones; real internet wins
         o.put("can_control", hasRoot());
         return o;
     }
@@ -549,7 +609,7 @@ public class FrpcService extends Service {
             } catch (Exception e) {
                 MainActivity.note(this, "selftest: " + e);
             }
-            for (int i = 0; i < 120 && !stopped; i++) {
+            for (int i = 0; i < selfSecs && !stopped; i++) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException e) {
@@ -620,6 +680,9 @@ public class FrpcService extends Service {
             o.put("err", firstErr);
         }
         selfTestJson = o.toString();
+        if (ok > 0) {
+            netOk = true;
+        }
         selfTest = ok + "/" + urls.length + (ok > 0 ? " OK, " + med + " ms" : " - no internet");
     }
 
