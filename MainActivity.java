@@ -2,6 +2,7 @@ package com.nodeconsole.node;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
@@ -37,9 +38,122 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning;
 
 import org.json.JSONObject;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+
 /** Scan the pairing QR from your dashboard (or paste the code), then tap Connect. */
 public class MainActivity extends Activity {
     static final String PREFS = "node";
+
+    // ---------------------------------------------------- crash log + diagnostics
+    private static boolean crashInstalled = false;
+    private static long pendingCrashStamp = 0;
+
+    /** Saves the stack trace of any crash to a file so the next launch can show it (and the panel can too). */
+    static synchronized void installCrashLog(Context ctx) {
+        if (crashInstalled) {
+            return;
+        }
+        crashInstalled = true;
+        final Context app = ctx.getApplicationContext();
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread t, Throwable e) {
+                try {
+                    StringWriter sw = new StringWriter();
+                    e.printStackTrace(new PrintWriter(sw));
+                    String s = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(new java.util.Date())
+                            + "  app " + appVersion(app) + "  Android " + Build.VERSION.RELEASE + "  " + Build.MODEL
+                            + "  thread " + t.getName() + "\n" + sw;
+                    writeText(new File(app.getFilesDir(), "crash.txt"), s.length() > 6000 ? s.substring(0, 6000) : s);
+                } catch (Throwable ignored) {
+                }
+                if (prev != null) {
+                    prev.uncaughtException(t, e);
+                }
+            }
+        });
+    }
+
+    static String appVersion(Context c) {
+        try {
+            return c.getPackageManager().getPackageInfo(c.getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    static String readText(File f) {
+        try {
+            FileInputStream in = new FileInputStream(f);
+            try {
+                byte[] b = new byte[(int) Math.min(f.length(), 40000)];
+                int n = in.read(b);
+                return n <= 0 ? "" : new String(b, 0, n, "UTF-8");
+            } finally {
+                in.close();
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static void writeText(File f, String s) throws Exception {
+        FileOutputStream o = new FileOutputStream(f);
+        try {
+            o.write(s.getBytes("UTF-8"));
+        } finally {
+            o.close();
+        }
+    }
+
+    static String crashText(Context c) {
+        File f = new File(c.getFilesDir(), "crash.txt");
+        return f.exists() ? readText(f) : null;
+    }
+
+    /** The crash text if the panel has not been told about it yet. */
+    static synchronized String pendingCrashReport(Context c) {
+        File f = new File(c.getFilesDir(), "crash.txt");
+        if (!f.exists()) {
+            return null;
+        }
+        long stamp = f.lastModified();
+        if (c.getSharedPreferences(PREFS, MODE_PRIVATE).getLong("crash_sent", 0) == stamp) {
+            return null;
+        }
+        pendingCrashStamp = stamp;
+        return readText(f);
+    }
+
+    static synchronized void markCrashSent(Context c) {
+        if (pendingCrashStamp != 0) {
+            c.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putLong("crash_sent", pendingCrashStamp).apply();
+            pendingCrashStamp = 0;
+        }
+    }
+
+    /** Short event log (kept to about 16 KB) that goes into the diagnostics text. */
+    static synchronized void note(Context c, String msg) {
+        try {
+            File f = new File(c.getFilesDir(), "app.log");
+            String old = f.exists() ? readText(f) : "";
+            if (old == null) {
+                old = "";
+            }
+            if (old.length() > 16000) {
+                old = old.substring(old.length() - 8000);
+            }
+            String line = new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US).format(new java.util.Date())
+                    + " " + msg + "\n";
+            writeText(f, old + line);
+        } catch (Throwable ignored) {
+        }
+    }
 
     // Same palette as the web dashboard
     private static final int INK = Color.parseColor("#0A0D0F");
@@ -55,7 +169,8 @@ public class MainActivity extends Activity {
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView statusView, detailView, warnView, ipView, netView, pairedView;
-    private View statusDot, warnCard, codeBox;
+    private View statusDot, warnCard, codeBox, crashCard;
+    private TextView crashView;
     private EditText codeInput;
     private Button connectButton;
 
@@ -158,6 +273,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        installCrashLog(this);
 
         Window w = getWindow();
         w.setStatusBarColor(INK);
@@ -176,6 +292,34 @@ public class MainActivity extends Activity {
         sub.setPadding(0, dp(2), 0, dp(6));
         head.addView(sub);
         root.addView(head);
+
+        // ---- shown only if the app crashed last time
+        crashCard = card();
+        crashCard.setBackground(shape(Color.parseColor("#2A1618"), Color.parseColor("#5A2A2A"), 14));
+        ((LinearLayout) crashCard).addView(text("The app crashed last time", 16, BAD, true));
+        crashView = text("", 11, TEXT, false);
+        crashView.setTypeface(Typeface.MONOSPACE);
+        crashView.setPadding(0, dp(6), 0, 0);
+        ((LinearLayout) crashCard).addView(crashView);
+        Button copyCrash = button("Copy crash details", 1);
+        copyCrash.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyText("Node Console crash", diagnostics());
+            }
+        });
+        ((LinearLayout) crashCard).addView(copyCrash);
+        Button dismissCrash = button("Dismiss", 1);
+        dismissCrash.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                new File(getFilesDir(), "crash.txt").delete();
+                crashCard.setVisibility(View.GONE);
+            }
+        });
+        ((LinearLayout) crashCard).addView(dismissCrash);
+        crashCard.setVisibility(View.GONE);
+        root.addView(crashCard);
 
         // ---- status card
         LinearLayout status = card();
@@ -237,11 +381,7 @@ public class MainActivity extends Activity {
         scan.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                if (!has(Manifest.permission.CAMERA) && Build.VERSION.SDK_INT >= 23) {
-                    requestPermissions(new String[]{Manifest.permission.CAMERA}, 2);
-                } else {
-                    scanQr();
-                }
+                scanQr();  // Google's scanner brings its own camera screen, so no permission is needed here
             }
         });
         pair.addView(scan);
@@ -317,6 +457,25 @@ public class MainActivity extends Activity {
         keep.addView(battery);
         root.addView(keep);
 
+        // ---- diagnostics
+        LinearLayout diag = card();
+        diag.addView(text("Something not working?", 17, TEXT, true));
+        TextView dtip = text("Copy the diagnostics and send them over. They hold the app version, phone model, status, recent errors and any crash. They do not hold your pairing code.", 13, MUTE, false);
+        dtip.setPadding(0, dp(4), 0, 0);
+        diag.addView(dtip);
+        Button copyDiag = button("Copy diagnostics", 1);
+        copyDiag.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyText("Node Console diagnostics", diagnostics());
+            }
+        });
+        diag.addView(copyDiag);
+        TextView ver = text("Version " + appVersion(this), 12, MUTE, false);
+        ver.setPadding(0, dp(10), 0, 0);
+        diag.addView(ver);
+        root.addView(diag);
+
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(INK);
         scroll.setFillViewport(true);
@@ -363,15 +522,7 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         super.onRequestPermissionsResult(code, perms, results);
-        if (code == 2) {  // tapped Scan without camera permission
-            if (has(Manifest.permission.CAMERA)) {
-                scanQr();
-            } else {
-                Toast.makeText(this, "Camera permission is off. Use the camera app or paste the code instead.", Toast.LENGTH_LONG).show();
-            }
-        } else {
-            askBatteryOnce();
-        }
+        askBatteryOnce();
     }
 
     /** Open the phone's own camera: scanning the dashboard QR there opens this app by itself. */
@@ -391,7 +542,7 @@ public class MainActivity extends Activity {
         Uri u = in.getData();
         if ("nodeconsole".equals(u.getScheme()) && u.getQueryParameter("c") != null) {
             in.setData(null);
-            savePairing(u.getQueryParameter("c"), true);
+            confirmPairing(u.getQueryParameter("c"), true);
         }
     }
 
@@ -411,7 +562,7 @@ public class MainActivity extends Activity {
                     .addOnSuccessListener(barcode -> {
                         String v = barcode.getRawValue();
                         if (v != null) {
-                            savePairing(v.trim(), true);
+                            confirmPairing(v.trim(), true);
                         }
                     })
                     .addOnFailureListener(e -> scannerUnavailable(e));
@@ -421,6 +572,7 @@ public class MainActivity extends Activity {
     }
 
     private void scannerUnavailable(Throwable e) {
+        note(this, "scanner: " + e);
         codeBox.setVisibility(View.VISIBLE);
         String why = e == null || e.getMessage() == null ? "" : " (" + e.getMessage() + ")";
         Toast.makeText(this, "Scanner failed" + why + ". Use the camera app or paste the code.", Toast.LENGTH_LONG).show();
@@ -448,6 +600,82 @@ public class MainActivity extends Activity {
 
     private boolean enabled() {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("enabled", false);
+    }
+
+    /** A scan or a link can come from anywhere, so say where it points before this phone joins it. */
+    private void confirmPairing(final String code, final boolean connectNow) {
+        String host;
+        try {
+            String c = code;
+            if (c.startsWith("nodeconsole://")) {
+                c = Uri.parse(c).getQueryParameter("c");
+            }
+            Uri pu = Uri.parse(decode(c).getString("p"));
+            host = pu.getHost() + (pu.getPort() > 0 ? ":" + pu.getPort() : "");
+        } catch (Exception e) {
+            Toast.makeText(this, "That is not a pairing code from your dashboard", Toast.LENGTH_LONG).show();
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Pair this phone?")
+                .setMessage("It will share its mobile connection with the panel at\n\n" + host
+                        + (enabled() ? "\n\nThis replaces the current pairing." : ""))
+                .setPositiveButton("Pair", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        savePairing(code, connectNow);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void copyText(String label, String s) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText(label, s));
+            Toast.makeText(this, "Copied. Paste it into your message.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not copy", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private String diagnostics() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        StringBuilder b = new StringBuilder();
+        b.append("Node Console ").append(appVersion(this)).append("\n");
+        b.append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append(", Android ")
+                .append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+        b.append("CPU: ").append(java.util.Arrays.toString(Build.SUPPORTED_ABIS)).append("\n");
+        try {
+            b.append("Google Play services: ").append(getPackageManager().getPackageInfo("com.google.android.gms", 0).versionName).append("\n");
+        } catch (Exception e) {
+            b.append("Google Play services: NOT INSTALLED\n");
+        }
+        String panel = sp.getString("panel", "");
+        Uri pu = Uri.parse(panel);
+        b.append("Panel: ").append(panel.length() == 0 ? "not paired" : pu.getHost() + (pu.getPort() > 0 ? ":" + pu.getPort() : "")).append("\n");
+        b.append("Connected: ").append(enabled()).append(", status: ").append(FrpcService.status).append("\n");
+        b.append("Tunnel log: ").append(FrpcService.lastLog).append("\n");
+        b.append("Root: ").append(FrpcService.rooted).append(", network: ").append(FrpcService.networkType)
+                .append(", IP: ").append(FrpcService.publicIp).append("\n");
+        b.append("Internet check: ").append(FrpcService.selfTest.length() == 0 ? "not run yet" : FrpcService.selfTest).append("\n");
+        b.append("Camera permission: ").append(has(Manifest.permission.CAMERA)).append(", notifications: ")
+                .append(Build.VERSION.SDK_INT < 33 || has("android.permission.POST_NOTIFICATIONS")).append("\n");
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            b.append("Battery optimisation off: ").append(pm.isIgnoringBatteryOptimizations(getPackageName())).append("\n");
+        } catch (Exception ignored) {
+        }
+        String log = readText(new File(getFilesDir(), "app.log"));
+        if (log != null && log.length() > 0) {
+            b.append("\n--- recent events ---\n").append(log.length() > 3000 ? log.substring(log.length() - 3000) : log);
+        }
+        String crash = crashText(this);
+        if (crash != null) {
+            b.append("\n--- last crash ---\n").append(crash);
+        }
+        return b.toString();
     }
 
     /** Validate and store a pairing code; optionally connect straight away (after a scan). */
@@ -549,10 +777,16 @@ public class MainActivity extends Activity {
 
         if (on) {
             detailView.setText((FrpcService.lastLog.length() > 0 ? "Tunnel: " + FrpcService.lastLog : "Starting the tunnel...")
+                    + "\nInternet check: " + (FrpcService.selfTest.length() == 0 ? "running soon" : FrpcService.selfTest)
                     + "\nRoot: " + (FrpcService.rooted ? "yes, remote IP rotation and data control are on"
                     : "no, remote IP rotation and data control are off"));
         } else {
             detailView.setText(paired ? "Ready. Tap Connect to go online." : "Scan the QR code from your dashboard to get started.");
+        }
+        String crash = crashText(this);
+        if (crash != null && crashCard.getVisibility() != View.VISIBLE) {
+            crashView.setText(crash.length() > 700 ? crash.substring(0, 700) + "..." : crash);
+            crashCard.setVisibility(View.VISIBLE);
         }
         ipView.setText(on && FrpcService.publicIp != null && FrpcService.publicIp.length() > 0 ? FrpcService.publicIp : "-");
         netView.setText(on && FrpcService.networkType != null && FrpcService.networkType.length() > 0 ? FrpcService.networkType : "-");

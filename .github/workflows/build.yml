@@ -34,6 +34,8 @@ jobs:
           mkdir -p app/src/main/res/drawable
           mv ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
           echo "android.useAndroidX=true" > gradle.properties
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '1.${{ github.run_number }}'/" app/build.gradle
+          grep -n "version" app/build.gradle
 
       - name: Download the official frp client (frpc) for Android CPUs
         run: |

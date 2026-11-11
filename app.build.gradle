@@ -18,6 +18,13 @@ android {
         }
     }
 
+    buildTypes {
+        debug {
+            // not debuggable: nobody can read the pairing token out of the app with adb
+            debuggable = false
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

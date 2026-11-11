@@ -11,6 +11,7 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
+import android.net.Uri;
 import android.net.NetworkCapabilities;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -38,6 +39,7 @@ import java.net.URL;
  * - downloads this device's frpc config and keeps the bundled frpc running
  * - handles "rotate", "data_off" and "data_on" commands (need root for now)
  * - reports battery level and whether mobile data is on
+ * - every 2 minutes tests the phone's own internet with 5 requests and reports the result
  * - watchdog: if mobile data stays off for a few minutes, switches it back on
  */
 public class FrpcService extends Service {
@@ -46,12 +48,17 @@ public class FrpcService extends Service {
     static volatile String networkType = "-";
     static volatile String lastLog = "";
     static volatile boolean rooted = false;
+    static volatile String selfTest = "";      // shown in the app, e.g. "5/5 OK, 310 ms"
+    static volatile String selfTestJson = null;  // sent with the next heartbeat
+    private static String cachedIp = null;
+    private static long cachedIpAt = 0;
     private static long rootCheckedAt = 0;
 
     private static final String CHANNEL = "node";
     private volatile boolean stopped = false;
     private Thread worker;
     private Thread watchdog;
+    private Thread tester;
     private boolean alerted = false;
     private Process frpc;
     private String cfgHash = "";
@@ -60,6 +67,12 @@ public class FrpcService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        MainActivity.installCrashLog(this);
     }
 
     @Override
@@ -95,6 +108,15 @@ public class FrpcService extends Service {
             }, "node-watchdog");
             watchdog.start();
         }
+        if (tester == null || !tester.isAlive()) {
+            tester = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    selfTestLoop();
+                }
+            }, "node-selftest");
+            tester.start();
+        }
         return START_STICKY;
     }
 
@@ -106,6 +128,9 @@ public class FrpcService extends Service {
         }
         if (watchdog != null) {
             watchdog.interrupt();
+        }
+        if (tester != null) {
+            tester.interrupt();
         }
         stopFrpc();
         if (wake != null && wake.isHeld()) {
@@ -130,6 +155,7 @@ public class FrpcService extends Service {
                     startFrpc(panel, token);
                     cfgHash = hash;
                 }
+                MainActivity.markCrashSent(this);  // the panel has the crash report now
                 sp.edit().putInt("auto_on_min", hb.optInt("auto_on_min", 5)).apply();
                 JSONArray cmds = hb.getJSONArray("commands");
                 for (int i = 0; i < cmds.length(); i++) {
@@ -147,6 +173,7 @@ public class FrpcService extends Service {
                 updateNotification(status + " - " + publicIp);
             } catch (Exception e) {
                 status = "Error: " + e.getMessage();
+                MainActivity.note(this, "heartbeat: " + e);
                 updateNotification(status);
             }
             for (int i = 0; i < 15 && !stopped; i++) {
@@ -176,6 +203,8 @@ public class FrpcService extends Service {
         stopFrpc();
         String toml = http("GET", panel + "/agent/frpc.toml", token, null);
         File cfg = new File(getFilesDir(), "frpc.toml");
+        cfg.setReadable(false, false);  // holds the device token: owner only
+        cfg.setReadable(true, true);
         FileOutputStream fo = new FileOutputStream(cfg);
         try {
             fo.write(toml.getBytes("UTF-8"));
@@ -410,11 +439,27 @@ public class FrpcService extends Service {
     // ----------------------------------------------------------------- info
     private JSONObject info() throws Exception {
         JSONObject o = new JSONObject();
-        String ip = fetchPublicIp();
+        long nowMs = System.currentTimeMillis();
+        if (cachedIp == null || nowMs - cachedIpAt > 45000L) {  // one lookup per 45 s keeps heartbeats quick
+            String fresh = fetchPublicIp();
+            if (fresh != null) {
+                cachedIp = fresh;
+                cachedIpAt = nowMs;
+            }
+        }
+        String ip = cachedIp;
         if (ip != null) {
             publicIp = ip;
         }
         o.put("ip", ip);
+        o.put("app_ver", MainActivity.appVersion(this));
+        if (selfTestJson != null) {
+            o.put("selftest", new JSONObject(selfTestJson));
+        }
+        String crash = MainActivity.pendingCrashReport(this);
+        if (crash != null) {
+            o.put("crash", crash);
+        }
         o.put("model", Build.MODEL);
         o.put("android", Build.VERSION.RELEASE);
         String carrier = "";
@@ -425,15 +470,36 @@ public class FrpcService extends Service {
         o.put("carrier", carrier);
         networkType = detectNetworkType();
         o.put("network_type", networkType);
-        Intent bat = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        if (bat != null) {
-            int level = bat.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-            int scale = bat.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
-            if (level >= 0 && scale > 0) {
-                o.put("battery", level * 100 / scale);
+        int pct = -1;
+        try {
+            Intent bat = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if (bat != null) {
+                int level = bat.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                int scale = bat.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                if (level >= 0 && scale > 0) {
+                    pct = level * 100 / scale;
+                }
+                int st = bat.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                o.put("charging", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
             }
-            int st = bat.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-            o.put("charging", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
+        } catch (Exception e) {
+            MainActivity.note(this, "battery intent: " + e);
+        }
+        if (pct < 0 && Build.VERSION.SDK_INT >= 21) {  // second source if the broadcast gives nothing
+            try {
+                BatteryManager bm = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
+                if (bm != null) {
+                    pct = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+                    if (pct <= 0 || pct > 100) {
+                        pct = -1;
+                    }
+                }
+            } catch (Exception e) {
+                MainActivity.note(this, "battery property: " + e);
+            }
+        }
+        if (pct >= 0) {
+            o.put("battery", pct);
         }
         o.put("data_enabled", mobileDataOn());
         o.put("can_control", hasRoot());
@@ -468,6 +534,93 @@ public class FrpcService extends Service {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    // ------------------------------------------------------- 2-minute internet test
+    private void selfTestLoop() {
+        try {
+            Thread.sleep(8000);
+        } catch (InterruptedException e) {
+            return;
+        }
+        while (!stopped) {
+            try {
+                runSelfTest();
+            } catch (Exception e) {
+                MainActivity.note(this, "selftest: " + e);
+            }
+            for (int i = 0; i < 120 && !stopped; i++) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /** 5 requests at once (4 HTTPS, 1 HTTP, one of them by IP so DNS problems show up separately). */
+    private void runSelfTest() throws Exception {
+        final String[] urls = {
+                "https://www.google.com/generate_204",
+                "https://connectivitycheck.gstatic.com/generate_204",
+                "https://www.cloudflare.com/cdn-cgi/trace",
+                "https://1.1.1.1/cdn-cgi/trace",
+                "http://clients3.google.com/generate_204"};
+        final long[] ms = new long[urls.length];
+        final String[] err = new String[urls.length];
+        Thread[] ts = new Thread[urls.length];
+        for (int i = 0; i < urls.length; i++) {
+            final int n = i;
+            ts[i] = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    long t0 = System.currentTimeMillis();
+                    try {
+                        HttpURLConnection c = (HttpURLConnection) new URL(urls[n]).openConnection();
+                        c.setConnectTimeout(7000);
+                        c.setReadTimeout(7000);
+                        c.setUseCaches(false);
+                        c.setInstanceFollowRedirects(false);
+                        int code = c.getResponseCode();
+                        c.disconnect();
+                        if (code >= 200 && code < 400) {
+                            ms[n] = System.currentTimeMillis() - t0;
+                        } else {
+                            err[n] = "HTTP " + code;
+                        }
+                    } catch (Exception e) {
+                        err[n] = e.getClass().getSimpleName();
+                    }
+                }
+            });
+            ts[i].start();
+        }
+        for (Thread t : ts) {
+            t.join(15000);
+        }
+        int ok = 0;
+        java.util.ArrayList<Long> good = new java.util.ArrayList<Long>();
+        String firstErr = null;
+        for (int i = 0; i < urls.length; i++) {
+            if (ms[i] > 0) {
+                ok++;
+                good.add(ms[i]);
+            } else if (firstErr == null) {
+                firstErr = Uri.parse(urls[i]).getHost() + ": " + (err[i] == null ? "timeout" : err[i]);
+            }
+        }
+        java.util.Collections.sort(good);
+        long med = good.isEmpty() ? 0 : good.get(good.size() / 2);
+        JSONObject o = new JSONObject();
+        o.put("ok", ok);
+        o.put("n", urls.length);
+        o.put("ms", med);
+        if (firstErr != null && ok < urls.length) {
+            o.put("err", firstErr);
+        }
+        selfTestJson = o.toString();
+        selfTest = ok + "/" + urls.length + (ok > 0 ? " OK, " + med + " ms" : " - no internet");
     }
 
     // ----------------------------------------------------------------- http
