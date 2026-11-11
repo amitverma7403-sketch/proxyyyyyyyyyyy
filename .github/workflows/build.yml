@@ -39,7 +39,7 @@ jobs:
           mkdir -p app/src/main/res/drawable
           mv ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
           echo "android.useAndroidX=true" > gradle.properties
-          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '1.6'/" app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '1.7'/" app/build.gradle
           grep -n "version" app/build.gradle
 
       - name: Download the official frp client (frpc) for Android CPUs
@@ -87,5 +87,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: NodeMax 1.6 build ${{ github.run_number }}
+          name: NodeMax 1.7 build ${{ github.run_number }}
           files: NodeMax.apk

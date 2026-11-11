@@ -529,6 +529,11 @@ public class FrpcService extends Service {
         o.put("carrier", carrier);
         networkType = detectNetworkType();
         o.put("network_type", networkType);
+        o.put("net_gen", netGen());
+        int dbm = signalDbm();
+        if (dbm != 0) {
+            o.put("signal_dbm", dbm);
+        }
         int pct = -1;
         try {
             Intent bat = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
@@ -564,6 +569,71 @@ public class FrpcService extends Service {
         o.put("data_enabled", mobileDataOn() || netOk);  // the setting is unreliable on some phones; real internet wins
         o.put("can_control", hasRoot());
         return o;
+    }
+
+    private static boolean phoneStateGrantTried = false;
+
+    /** 5G / 4G / 3G / 2G / WIFI, or MOBILE when the phone will not say. Needs READ_PHONE_STATE for the cellular split. */
+    private String netGen() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            NetworkCapabilities caps = cm.getNetworkCapabilities(cm.getActiveNetwork());
+            if (caps == null) {
+                return "none";
+            }
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                return "WIFI";
+            }
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                return "OTHER";
+            }
+        } catch (Exception e) {
+            return "";
+        }
+        try {
+            if (checkSelfPermission("android.permission.READ_PHONE_STATE") != 0) {
+                if (!phoneStateGrantTried && hasRoot()) {  // rooted phones: grant it quietly, once per run
+                    phoneStateGrantTried = true;
+                    su("pm grant " + getPackageName() + " android.permission.READ_PHONE_STATE");
+                }
+                return "MOBILE";
+            }
+            TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+            int t = Build.VERSION.SDK_INT >= 24 ? tm.getDataNetworkType() : tm.getNetworkType();
+            switch (t) {
+                case 20:
+                    return "5G";
+                case 13:
+                case 19:
+                    return "4G";
+                case 3: case 5: case 6: case 8: case 9: case 10: case 12: case 14: case 15: case 17:
+                    return "3G";
+                case 1: case 2: case 4: case 7: case 11: case 16:
+                    return "2G";
+                default:
+                    return "MOBILE";
+            }
+        } catch (Exception e) {
+            return "MOBILE";
+        }
+    }
+
+    /** Mobile signal in dBm, or 0 when unknown. */
+    private int signalDbm() {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                NetworkCapabilities caps = cm.getNetworkCapabilities(cm.getActiveNetwork());
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    int v = caps.getSignalStrength();
+                    if (v != Integer.MIN_VALUE && v < 0 && v > -150) {
+                        return v;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return 0;
     }
 
     private String detectNetworkType() {
