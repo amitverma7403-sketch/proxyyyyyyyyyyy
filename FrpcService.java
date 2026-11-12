@@ -291,7 +291,16 @@ public class FrpcService extends Service {
         if (!bin.exists()) {
             throw new Exception("tunnel program missing for this phone's CPU");
         }
-        ProcessBuilder pb = new ProcessBuilder(bin.getAbsolutePath(), "-c", cfg.getAbsolutePath());
+        // Every proxied connection costs the tunnel program two file handles, and some phones start apps with a low
+        // limit (1024). Raise it to the most the phone allows before starting; fall back to a plain start if there is no shell.
+        ProcessBuilder pb;
+        if (new File("/system/bin/sh").exists()) {
+            pb = new ProcessBuilder("/system/bin/sh", "-c",
+                    "ulimit -n $(ulimit -Hn) 2>/dev/null; exec \"$0\" \"$@\"",
+                    bin.getAbsolutePath(), "-c", cfg.getAbsolutePath());
+        } else {
+            pb = new ProcessBuilder(bin.getAbsolutePath(), "-c", cfg.getAbsolutePath());
+        }
         pb.directory(getFilesDir());
         pb.redirectErrorStream(true);
         final Process p = pb.start();
