@@ -32,14 +32,14 @@ jobs:
           set -e
           mkdir -p app/src/main/java/com/nodemax/app app/src/main/res/xml
           mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
-          mv MainActivity.java FrpcService.java BootReceiver.java App.java Push.java PushService.java app/src/main/java/com/nodemax/app/
+          mv MainActivity.java FrpcService.java BootReceiver.java App.java Push.java PushService.java Updater.java UpdateReceiver.java app/src/main/java/com/nodemax/app/
           mv network_security_config.xml data_extraction_rules.xml app/src/main/res/xml/
           mv AndroidManifest.xml app/src/main/
           mv app.build.gradle app/build.gradle
           mkdir -p app/src/main/res/drawable
           mv ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
           echo "android.useAndroidX=true" > gradle.properties
-          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '2.0'/" app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '2.1'/" app/build.gradle
           grep -n "version" app/build.gradle
 
       - name: Download the official frp client (frpc) for Android CPUs
@@ -87,5 +87,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: NodeMax 2.0 build ${{ github.run_number }}
+          name: NodeMax 2.1 build ${{ github.run_number }}
           files: NodeMax.apk

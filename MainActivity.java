@@ -188,6 +188,11 @@ public class MainActivity extends Activity {
     private View statusDot, warnCard;
     private Button connectButton, payoutButton;
     private LinearLayout noticeBox;
+    private LinearLayout updateCard;
+    private TextView updateTitle, updateText;
+    private Button updateButton;
+    private Updater.Info upd = null;
+    private boolean updBusy = false;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -470,6 +475,11 @@ public class MainActivity extends Activity {
         super.onResume();
         ui.removeCallbacks(tick);
         ui.post(tick);
+        String um = sp.getString("update_msg", "");
+        if (um.length() > 0) {
+            sp.edit().remove("update_msg").apply();
+            toast(um);
+        }
         if ("home".equals(screen)) {
             loadMe();
         }
@@ -611,6 +621,7 @@ public class MainActivity extends Activity {
     private void showHome() {
         screen = "home";
         header("Share and earn", null);
+        buildUpdateCard();
 
         // connect
         LinearLayout c = card();
@@ -706,6 +717,19 @@ public class MainActivity extends Activity {
         acctView = text("", 14, MUTE, false);
         acctView.setPadding(0, dp(6), 0, 0);
         a.addView(acctView);
+        TextView ver = text("Version " + appVersion(this) + " (build " + Updater.myCode(this) + ")", 13, MUTE, false);
+        ver.setPadding(0, dp(6), 0, 0);
+        a.addView(ver);
+        if (Updater.allowed(this)) {
+            Button upb = button("Check for updates", 1);
+            upb.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    checkUpdate(true);
+                }
+            });
+            a.addView(upb);
+        }
         Button pol = button("Privacy policy", 1);
         pol.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -756,6 +780,139 @@ public class MainActivity extends Activity {
         me = null;
         refresh();
         loadMe();
+        checkUpdate(false);
+    }
+
+    // ------------------------------------------------------- updates inside the app
+    private void buildUpdateCard() {
+        updateCard = card();
+        updateCard.setBackground(shape(Color.parseColor("#0C2230"), Color.parseColor("#1E4F6B"), 18));
+        updateTitle = text("Update available", 16, TEXT, true);
+        updateText = text("", 14, MUTE, false);
+        updateText.setPadding(0, dp(6), 0, 0);
+        updateButton = button("Update now", 0);
+        updateButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startUpdate();
+            }
+        });
+        updateCard.addView(updateTitle);
+        updateCard.addView(updateText);
+        updateCard.addView(updateButton);
+        updateCard.setVisibility(upd != null ? View.VISIBLE : View.GONE);
+        page.addView(updateCard);
+        if (upd != null) {
+            showUpdate(upd, false);
+        }
+    }
+
+    /** Asks the server whether a newer build exists. Automatic checks run at most every 3 hours; the button always checks. */
+    private void checkUpdate(final boolean manual) {
+        if (!Updater.allowed(this)) {
+            if (manual) {
+                toast("This copy is updated by Google Play.");
+            }
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!manual && now - sp.getLong("upd_at", 0) < 3L * 3600 * 1000) {
+            return;
+        }
+        sp.edit().putLong("upd_at", now).apply();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Updater.Info i = Updater.check(MainActivity.this);
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (i == null) {
+                            if (manual) {
+                                toast("Could not check for updates. Try again.");
+                            }
+                        } else if (i.latest > Updater.myCode(MainActivity.this) && i.url.length() > 0) {
+                            upd = i;
+                            showUpdate(i, manual);
+                        } else {
+                            upd = null;
+                            if (updateCard != null) {
+                                updateCard.setVisibility(View.GONE);
+                            }
+                            if (manual) {
+                                toast("You have the newest version.");
+                            }
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void showUpdate(Updater.Info i, boolean manual) {
+        if (updateCard == null || !"home".equals(screen)) {
+            return;
+        }
+        updateTitle.setText(i.required ? "Update required" : "Update available");
+        String mb = i.size > 0 ? " About " + Math.max(1, Math.round(i.size / 1048576f)) + " MB." : "";
+        updateText.setText("A newer version of NodeMax is ready (" + i.name + ")." + mb
+                + (i.note.length() > 0 ? "\n" + i.note : "")
+                + "\nAfter the download, Android asks you to tap Install. Your account and earnings stay as they are.");
+        updateCard.setVisibility(View.VISIBLE);
+    }
+
+    private void startUpdate() {
+        final Updater.Info i = upd;
+        if (i == null || updBusy) {
+            return;
+        }
+        if (!Updater.ensurePermission(this)) {
+            toast("Switch on 'Allow from this source' for NodeMax, go back, and tap Update again.");
+            return;
+        }
+        updBusy = true;
+        updateButton.setEnabled(false);
+        updateButton.setText("Downloading...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String err = null;
+                try {
+                    java.io.File f = Updater.download(MainActivity.this, i, new Updater.Progress() {
+                        @Override
+                        public void percent(final int p) {
+                            ui.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    updateButton.setText("Downloading " + p + "%");
+                                }
+                            });
+                        }
+                    });
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            updateButton.setText("Installing...");
+                        }
+                    });
+                    Updater.install(MainActivity.this, f);
+                } catch (Exception e) {
+                    err = e.getMessage() == null ? "The update failed. Try again." : e.getMessage();
+                }
+                final String fe = err;
+                ui.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        updBusy = false;
+                        updateButton.setEnabled(true);
+                        updateButton.setText("Update now");
+                        if (fe != null) {
+                            toast(fe);
+                        }
+                    }
+                }, fe != null ? 0 : 5000);
+            }
+        }).start();
     }
 
     private boolean enabled() {
