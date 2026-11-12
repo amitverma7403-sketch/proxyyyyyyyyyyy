@@ -3,21 +3,21 @@ package com.nodemax.app;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.Service;
 import android.app.PendingIntent;
+import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
-import android.net.Uri;
 import android.net.NetworkCapabilities;
+import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
-import android.provider.Settings;
 import android.telephony.TelephonyManager;
 
 import org.json.JSONArray;
@@ -34,30 +34,28 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * Keeps this phone connected to your panel:
- * - heartbeat every 15s (public IP, carrier, network type)
- * - downloads this device's frpc config and keeps the bundled frpc running
- * - handles "rotate", "data_off" and "data_on" commands (need root for now)
- * - reports battery level and whether mobile data is on
- * - every 2 minutes tests the phone's own internet with 5 requests and reports the result
- * - watchdog: if mobile data stays off for a few minutes, switches it back on
+ * Runs while the person has tapped Connect. It keeps this phone linked to the NodeMax network:
+ * - a heartbeat every few seconds (battery, network type, carrier, public IP)
+ * - keeps the bundled tunnel program (frpc) running with this phone's settings
+ * - shows notifications the server sends and confirms each one
+ * - checks the phone's own internet; after 3 failed checks in 2 minutes it tells the person
+ * The service stops as soon as the person taps Disconnect.
  */
 public class FrpcService extends Service {
     static volatile String status = "Stopped";
     static volatile String publicIp = "-";
     static volatile String networkType = "-";
     static volatile String lastLog = "";
-    static volatile boolean rooted = false;
-    static volatile String selfTest = "";      // shown in the app, e.g. "5/5 OK, 310 ms"
-    static volatile String selfTestJson = null;  // sent with the next heartbeat
-    static volatile int hbSecs = 20;              // heartbeat interval, set by the panel's power mode
+    static volatile String selfTest = "";         // shown in the app, e.g. "5/5 OK, 310 ms"
+    static volatile String selfTestJson = null;   // sent with the next heartbeat
+    static volatile int hbSecs = 20;              // heartbeat interval, set by the server
     static volatile int selfSecs = 300;           // how often the phone tests its own internet
-    static volatile String wakeMode = "charging"; // always | charging | never
+    static volatile String wakeMode = "always";   // always | charging | never
     static volatile boolean chargingNow = false;
     static volatile boolean netOk = true;         // last known real internet state
+    static volatile boolean running = false;
     private static String cachedIp = null;
     private static long cachedIpAt = 0;
-    private static long rootCheckedAt = 0;
 
     private static final String CHANNEL = "node";
     private volatile boolean stopped = false;
@@ -69,6 +67,7 @@ public class FrpcService extends Service {
     private Process frpc;
     private String cfgHash = "";
     private PowerManager.WakeLock wake;
+    private WifiManager.WifiLock wifiLock;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -84,12 +83,19 @@ public class FrpcService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         // Android requires startForeground() right after startForegroundService(), even if we then stop
-        startAsForeground("Starting...");
+        try {
+            startAsForeground("Starting...");
+        } catch (Throwable e) {
+            MainActivity.note(this, "startForeground: " + e);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
         if (!sp.getBoolean("enabled", false)) {
             stopSelf();
             return START_NOT_STICKY;
         }
+        running = true;
         if (worker == null || !worker.isAlive()) {
             stopped = false;
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -97,9 +103,17 @@ public class FrpcService extends Service {
                 wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nodemax:tunnel");
                 wake.setReferenceCounted(false);
             }
+            try {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm != null && wifiLock == null) {
+                    wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "nodemax:wifi");
+                    wifiLock.setReferenceCounted(false);
+                }
+            } catch (Throwable ignored) {
+            }
             hbSecs = sp.getInt("hb_secs", 20);
             selfSecs = sp.getInt("selftest_secs", 300);
-            wakeMode = sp.getString("wake", "charging");
+            wakeMode = sp.getString("wake", "always");
             applyWake();
             worker = new Thread(new Runnable() {
                 @Override
@@ -113,9 +127,9 @@ public class FrpcService extends Service {
             watchdog = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    watchLoop();
+                    netWatchLoop();
                 }
-            }, "node-watchdog");
+            }, "node-netwatch");
             watchdog.start();
         }
         if (tester == null || !tester.isAlive()) {
@@ -133,6 +147,7 @@ public class FrpcService extends Service {
     @Override
     public void onDestroy() {
         stopped = true;
+        running = false;
         if (worker != null) {
             worker.interrupt();
         }
@@ -143,24 +158,43 @@ public class FrpcService extends Service {
             tester.interrupt();
         }
         stopFrpc();
-        if (wake != null && wake.isHeld()) {
-            wake.release();
+        try {
+            if (wake != null && wake.isHeld()) {
+                wake.release();
+            }
+            if (wifiLock != null && wifiLock.isHeld()) {
+                wifiLock.release();
+            }
+        } catch (Throwable ignored) {
         }
         wake = null;
+        wifiLock = null;
         status = "Stopped";
         super.onDestroy();
     }
 
-    /** The wake lock keeps the CPU awake with the screen off. It costs battery, so it follows the power mode. */
+    /**
+     * Keeps the CPU and Wi-Fi awake with the screen off. Without this Android puts a locked, unplugged phone to
+     * sleep after a while and the connection drops, so it is held the whole time unless the server says "never".
+     */
     private synchronized void applyWake() {
-        if (wake == null) {
-            return;
-        }
-        boolean want = "always".equals(wakeMode) || ("charging".equals(wakeMode) && chargingNow);
-        if (want && !wake.isHeld()) {
-            wake.acquire();
-        } else if (!want && wake.isHeld()) {
-            wake.release();
+        boolean want = !"never".equals(wakeMode);
+        try {
+            if (wake != null) {
+                if (want && !wake.isHeld()) {
+                    wake.acquire();
+                } else if (!want && wake.isHeld()) {
+                    wake.release();
+                }
+            }
+            if (wifiLock != null) {
+                if (want && !wifiLock.isHeld()) {
+                    wifiLock.acquire();
+                } else if (!want && wifiLock.isHeld()) {
+                    wifiLock.release();
+                }
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -172,35 +206,49 @@ public class FrpcService extends Service {
         status = "Connecting...";
         while (!stopped) {
             try {
-                JSONObject hb = new JSONObject(http("POST", panel + "/agent/heartbeat", token, info().toString()));
+                JSONObject hb = new JSONObject(http("POST", panel + "/agent/heartbeat", token, info(sp).toString()));
                 String hash = hb.getString("cfg_hash");
                 if (!hash.equals(cfgHash) || !frpcAlive()) {
                     startFrpc(panel, token);
                     cfgHash = hash;
                 }
-                MainActivity.markCrashSent(this);  // the panel has the crash report now
+                MainActivity.markCrashSent(this);  // the server has the crash report now
                 hbSecs = Math.max(10, Math.min(120, hb.optInt("hb_secs", hbSecs)));
                 selfSecs = Math.max(60, Math.min(3600, hb.optInt("selftest_secs", selfSecs)));
                 wakeMode = hb.optString("wake", wakeMode);
-                sp.edit().putInt("auto_on_min", hb.optInt("auto_on_min", 5)).putInt("hb_secs", hbSecs)
-                        .putInt("selftest_secs", selfSecs).putString("wake", wakeMode).apply();
+                sp.edit().putInt("hb_secs", hbSecs).putInt("selftest_secs", selfSecs).putString("wake", wakeMode).apply();
                 applyWake();
-                JSONArray cmds = hb.getJSONArray("commands");
-                for (int i = 0; i < cmds.length(); i++) {
-                    JSONObject c = cmds.getJSONObject(i);
-                    String op = c.getString("op");
-                    if ("rotate".equals(op)) {
-                        rotate(panel, token, c.getInt("id"));
-                    } else if ("data_off".equals(op)) {
-                        dataOff(panel, token, c.getInt("id"), c.optString("arg", "5"));
-                    } else if ("data_on".equals(op)) {
-                        dataOn(panel, token, c.getInt("id"));
+                JSONArray cmds = hb.optJSONArray("commands");
+                for (int i = 0; cmds != null && i < cmds.length(); i++) {
+                    // this app has no remote controls: say so, so the server does not keep asking
+                    sendAck(panel, token, cmds.getJSONObject(i).getInt("id"), false, "not supported by this app");
+                }
+                JSONArray notices = hb.optJSONArray("notices");
+                if (notices != null && notices.length() > 0) {
+                    JSONArray ids = new JSONArray();
+                    for (int i = 0; i < notices.length(); i++) {
+                        JSONObject n = notices.getJSONObject(i);
+                        showNotice(this, 1000 + n.getInt("id"), n.optString("title", "NodeMax"), n.optString("body", ""));
+                        ids.put(n.getInt("id"));
+                    }
+                    try {
+                        http("POST", panel + "/agent/notice_ack", token, new JSONObject().put("ids", ids).toString());
+                    } catch (Exception e) {
+                        MainActivity.note(this, "notice ack: " + e);
                     }
                 }
                 status = frpcAlive() ? "Connected" : "Tunnel program not running";
-                updateNotification(status + " - " + publicIp);
+                updateNotification(frpcAlive() ? "Connected. You are earning while this is on." : status);
             } catch (Exception e) {
-                status = "Error: " + e.getMessage();
+                String m = String.valueOf(e.getMessage());
+                if (m.contains("HTTP 401")) {  // the phone was removed on the server: stop cleanly, the app asks to connect again
+                    status = "Disconnected by the server. Open the app and tap Connect.";
+                    sp.edit().putBoolean("enabled", false).apply();
+                    updateNotification(status);
+                    stopSelf();
+                    return;
+                }
+                status = netOk ? "Reconnecting..." : "No internet";
                 MainActivity.note(this, "heartbeat: " + e);
                 updateNotification(status);
             }
@@ -270,185 +318,63 @@ public class FrpcService extends Service {
         }
     }
 
-    // --------------------------------------------------------------- rotate
-    private void rotate(String panel, String token, int id) {
-        String old = fetchPublicIp();
-        boolean ok = false;
-        String result;
-        String now = old;
-        if (!hasRoot()) {
-            sendAck(panel, token, id, false, "IP rotation needs root on this phone", old);
-            return;
-        }
+    private void sendAck(String panel, String token, int id, boolean ok, String result) {
         try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "svc data disable; sleep 4; svc data enable"});
-            int rc = p.waitFor();
-            ok = rc == 0;
-            result = ok ? "" : "su exited with code " + rc;
-        } catch (Exception e) {
-            result = "IP rotation needs root on this phone";
-        }
-        if (ok) {
-            for (int i = 0; i < 20 && !stopped; i++) {
-                try {
-                    Thread.sleep(2000);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                String ip = fetchPublicIp();
-                if (ip != null && !ip.equals(old)) {
-                    now = ip;
-                    break;
-                }
-            }
-            result = old + " -> " + now;
-        }
-        sendAck(panel, token, id, ok, result, now);
-    }
-
-    private void sendAck(String panel, String token, int id, boolean ok, String result, String ip) {
-        for (int i = 0; i < 15 && !stopped; i++) {
-            try {
-                JSONObject body = new JSONObject();
-                body.put("id", id);
-                body.put("ok", ok);
-                body.put("result", result);
-                if (ip != null) {
-                    body.put("ip", ip);
-                }
-                http("POST", panel + "/agent/ack", token, body.toString());
-                return;
-            } catch (Exception e) {
-                try {
-                    Thread.sleep(3000);
-                } catch (InterruptedException ie) {
-                    return;
-                }
-            }
-        }
-    }
-
-    // ----------------------------------------------------- mobile data on/off
-    /** True when this phone grants root. A "no" is re-checked every 5 minutes (root managers can be slow to prompt). */
-    static boolean hasRoot() {
-        if (rooted) {
-            return true;
-        }
-        long now = System.currentTimeMillis();
-        if (rootCheckedAt != 0 && now - rootCheckedAt < 300000L) {
-            return false;
-        }
-        rootCheckedAt = now;
-        final int[] rc = {-1};
-        Thread t = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                rc[0] = su("id");
-            }
-        });
-        t.start();
-        try {
-            t.join(6000);
-        } catch (InterruptedException ignored) {
-        }
-        rooted = rc[0] == 0;
-        return rooted;
-    }
-
-    private static int su(String cmd) {
-        try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            return p.waitFor();
-        } catch (Exception e) {
-            return -1;
-        }
-    }
-
-    private boolean mobileDataOn() {
-        try {
-            return Settings.Global.getInt(getContentResolver(), "mobile_data", 1) == 1;
-        } catch (Exception e) {
-            return true;
-        }
-    }
-
-    /** Panel asked for data off. Answer first (the link dies right after), then switch it off. */
-    private void dataOff(String panel, String token, int id, String arg) {
-        int mins = 5;
-        try {
-            mins = Math.max(1, Math.min(60, Integer.parseInt(arg)));
+            JSONObject body = new JSONObject();
+            body.put("id", id);
+            body.put("ok", ok);
+            body.put("result", result);
+            http("POST", panel + "/agent/ack", token, body.toString());
         } catch (Exception ignored) {
         }
-        if (!hasRoot()) {
-            sendAck(panel, token, id, false, "mobile data control needs root on this phone", null);
-            return;
-        }
-        SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
-        sp.edit().putLong("auto_on_at", System.currentTimeMillis() + mins * 60000L).apply();
-        alerted = false;
-        sendAck(panel, token, id, true, "data off for " + mins + " min", null);
-        su("svc data disable");
     }
 
-    private void dataOn(String panel, String token, int id) {
-        boolean ok = su("svc data enable") == 0;
-        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit().putLong("auto_on_at", 0).apply();
-        sendAck(panel, token, id, ok, ok ? "data on" : "mobile data control needs root on this phone", null);
-    }
-
+    // --------------------------------------------- internet on but not working
     /**
-     * Runs on its own thread because the panel cannot be reached while data is off.
-     * Whenever mobile data is off (from the panel or by hand) it is switched back on after a few minutes.
+     * Every 40 seconds, while the phone says it has a network, make one tiny real request.
+     * Three failures in a row (about two minutes) means the internet is on but not working:
+     * the person gets a notification, once per incident.
      */
-    private void watchLoop() {
-        SharedPreferences sp = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
-        long tick = 30000L;
+    private void netWatchLoop() {
         while (!stopped) {
             try {
-                Thread.sleep(tick);
+                Thread.sleep(40000L);
             } catch (InterruptedException e) {
                 return;
             }
             try {
-                int mins = sp.getInt("auto_on_min", 5);
-                long at = sp.getLong("auto_on_at", 0);
-                long now = System.currentTimeMillis();
-                tick = at != 0 ? 15000L : 30000L;  // look more often only while a countdown runs
-                if (mobileDataOn() || internetOk()) {
-                    // The data switch can read "off" on phones that still have internet (no root, vendor quirks),
-                    // so a working connection always wins. This costs no network traffic while the switch says on.
-                    netOk = true;
-                    if (at != 0) {
-                        sp.edit().putLong("auto_on_at", 0).apply();
+                if (!hasNetwork()) {       // no network at all (flight mode, no signal): Android already shows that
+                    netOk = false;
+                    strikes = 0;
+                    continue;
+                }
+                if (internetOk()) {
+                    if (alerted) {
+                        cancelNotice(2);
                     }
+                    netOk = true;
                     alerted = false;
                     strikes = 0;
                     continue;
                 }
                 netOk = false;
-                if (mins <= 0) {
-                    continue;
+                strikes++;
+                if (strikes >= 3 && !alerted) {
+                    alerted = true;
+                    alertNoInternet();
                 }
-                if (at == 0) {  // really offline with data off: start the countdown
-                    // No root means nothing can be switched on here, so only wait 60 s and check once more.
-                    at = now + (hasRoot() ? mins * 60000L : 60000L);
-                    sp.edit().putLong("auto_on_at", at).apply();
-                }
-                if (now >= at) {
-                    if (hasRoot() && su("svc data enable") == 0) {
-                        sp.edit().putLong("auto_on_at", 0).apply();
-                        strikes = 0;
-                    } else {
-                        strikes++;
-                        sp.edit().putLong("auto_on_at", now + 60000L).apply();  // check again in a minute
-                        if (strikes >= 2 && !alerted) {  // tell the person only if it failed twice in a row
-                            alerted = true;
-                            alertDataOff();
-                        }
-                    }
-                }
-            } catch (Exception ignored) {
+            } catch (Throwable ignored) {
             }
+        }
+    }
+
+    private boolean hasNetwork() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            NetworkCapabilities caps = cm.getNetworkCapabilities(cm.getActiveNetwork());
+            return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Throwable e) {
+            return true;
         }
     }
 
@@ -473,30 +399,49 @@ public class FrpcService extends Service {
         return false;
     }
 
-    private void alertDataOff() {
+    private void alertNoInternet() {
+        MainActivity.note(this, "internet on but not working: 3 checks failed");
+        showNotice(this, 2, "Internet is not working",
+                "Your phone is connected to a network but the internet did not work in 3 checks. "
+                        + "Check mobile data, signal or your recharge. You earn only while it works.");
+    }
+
+    private void cancelNotice(int id) {
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (nm == null) {
-            return;
+        if (nm != null) {
+            nm.cancel(id);
         }
-        PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(Settings.ACTION_WIRELESS_SETTINGS),
-                PendingIntent.FLAG_IMMUTABLE);
-        Notification.Builder b;
-        if (Build.VERSION.SDK_INT >= 26) {
-            nm.createNotificationChannel(new NotificationChannel("alert", "Needs attention", NotificationManager.IMPORTANCE_HIGH));
-            b = new Notification.Builder(this, "alert");
-        } else {
-            b = new Notification.Builder(this);
+    }
+
+    /** Shows a message from NodeMax. Used for server notifications, push messages and the internet warning. */
+    static void showNotice(Context ctx, int id, String title, String body) {
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) {
+                return;
+            }
+            Intent open = new Intent(ctx, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pi = PendingIntent.getActivity(ctx, id, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            Notification.Builder b;
+            if (Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(new NotificationChannel("alert", "Messages from NodeMax", NotificationManager.IMPORTANCE_HIGH));
+                b = new Notification.Builder(ctx, "alert");
+            } else {
+                b = new Notification.Builder(ctx);
+            }
+            nm.notify(id, b.setContentTitle(title)
+                    .setContentText(body)
+                    .setStyle(new Notification.BigTextStyle().bigText(body))
+                    .setSmallIcon(android.R.drawable.stat_notify_chat)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .build());
+        } catch (Throwable ignored) {
         }
-        nm.notify(2, b.setContentTitle("No internet on this phone")
-                .setContentText("Mobile data looks off and the phone could not fix it twice. Tap to turn it on.")
-                .setSmallIcon(android.R.drawable.stat_notify_error)
-                .setContentIntent(pi)
-                .setAutoCancel(true)
-                .build());
     }
 
     // ----------------------------------------------------------------- info
-    private JSONObject info() throws Exception {
+    private JSONObject info(SharedPreferences sp) throws Exception {
         JSONObject o = new JSONObject();
         long nowMs = System.currentTimeMillis();
         if (cachedIp == null || nowMs - cachedIpAt > 120000L) {  // one lookup per 2 minutes: fewer radio wake-ups
@@ -519,7 +464,11 @@ public class FrpcService extends Service {
         if (crash != null) {
             o.put("crash", crash);
         }
-        o.put("model", Build.MODEL);
+        String fcm = sp.getString("fcm_token", "");
+        if (fcm.length() > 0) {
+            o.put("fcm", fcm);
+        }
+        o.put("model", Build.MANUFACTURER + " " + Build.MODEL);
         o.put("android", Build.VERSION.RELEASE);
         String carrier = "";
         TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
@@ -550,7 +499,7 @@ public class FrpcService extends Service {
         } catch (Exception e) {
             MainActivity.note(this, "battery intent: " + e);
         }
-        if (pct < 0 && Build.VERSION.SDK_INT >= 21) {  // second source if the broadcast gives nothing
+        if (pct < 0) {  // second source if the broadcast gives nothing
             try {
                 BatteryManager bm = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
                 if (bm != null) {
@@ -566,14 +515,12 @@ public class FrpcService extends Service {
         if (pct >= 0) {
             o.put("battery", pct);
         }
-        o.put("data_enabled", mobileDataOn() || netOk);  // the setting is unreliable on some phones; real internet wins
-        o.put("can_control", hasRoot());
+        o.put("data_enabled", netOk);
+        o.put("can_control", false);
         return o;
     }
 
-    private static boolean phoneStateGrantTried = false;
-
-    /** 5G / 4G / 3G / 2G / WIFI, or MOBILE when the phone will not say. Needs READ_PHONE_STATE for the cellular split. */
+    /** 5G / 4G / 3G / 2G / WIFI, or MOBILE when the phone will not say (Android 12 and older). */
     private String netGen() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -587,20 +534,13 @@ public class FrpcService extends Service {
             if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
                 return "OTHER";
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             return "";
         }
         try {
-            if (checkSelfPermission("android.permission.READ_PHONE_STATE") != 0) {
-                if (!phoneStateGrantTried && hasRoot()) {  // rooted phones: grant it quietly, once per run
-                    phoneStateGrantTried = true;
-                    su("pm grant " + getPackageName() + " android.permission.READ_PHONE_STATE");
-                }
-                return "MOBILE";
-            }
+            // Android 13+ answers this with the basic phone state permission, which needs no prompt
             TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
-            int t = Build.VERSION.SDK_INT >= 24 ? tm.getDataNetworkType() : tm.getNetworkType();
-            switch (t) {
+            switch (tm.getDataNetworkType()) {
                 case 20:
                     return "5G";
                 case 13:
@@ -613,7 +553,7 @@ public class FrpcService extends Service {
                 default:
                     return "MOBILE";
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             return "MOBILE";
         }
     }
@@ -631,7 +571,7 @@ public class FrpcService extends Service {
                     }
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
         }
         return 0;
     }
@@ -649,7 +589,7 @@ public class FrpcService extends Service {
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
                 return "mobile";
             }
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
         }
         return "unknown";
     }
@@ -666,7 +606,7 @@ public class FrpcService extends Service {
         }
     }
 
-    // ------------------------------------------------------- 2-minute internet test
+    // ------------------------------------------------------- regular internet test
     private void selfTestLoop() {
         try {
             Thread.sleep(8000);
@@ -689,7 +629,7 @@ public class FrpcService extends Service {
         }
     }
 
-    /** 5 requests at once (4 HTTPS, 1 HTTP, one of them by IP so DNS problems show up separately). */
+    /** 5 requests at once (one of them by IP so DNS problems show up separately). */
     private void runSelfTest() throws Exception {
         final String[] urls = {
                 "https://www.google.com/generate_204",
@@ -757,12 +697,14 @@ public class FrpcService extends Service {
     }
 
     // ----------------------------------------------------------------- http
-    private static String http(String method, String url, String token, String body) throws Exception {
+    static String http(String method, String url, String token, String body) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestMethod(method);
         c.setConnectTimeout(10000);
         c.setReadTimeout(20000);
-        c.setRequestProperty("Authorization", "Bearer " + token);
+        if (token != null && token.length() > 0) {
+            c.setRequestProperty("Authorization", "Bearer " + token);
+        }
         if (body != null) {
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", "application/json");
@@ -775,12 +717,12 @@ public class FrpcService extends Service {
         }
         int code = c.getResponseCode();
         if (code >= 400) {
-            throw new Exception("panel answered HTTP " + code);
+            throw new Exception("server answered HTTP " + code);
         }
         return readAll(c.getInputStream());
     }
 
-    private static String readAll(InputStream in) throws Exception {
+    static String readAll(InputStream in) throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buf = new byte[4096];
         int n;
@@ -797,7 +739,9 @@ public class FrpcService extends Service {
     // --------------------------------------------------------- notification
     private void startAsForeground(String text) {
         Notification n = buildNotification(text);
-        if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else if (Build.VERSION.SDK_INT >= 29) {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         } else {
             startForeground(1, n);
@@ -809,15 +753,18 @@ public class FrpcService extends Service {
         Notification.Builder b;
         if (Build.VERSION.SDK_INT >= 26) {
             if (nm != null) {
-                nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Node status", NotificationManager.IMPORTANCE_LOW));
+                nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Sharing status", NotificationManager.IMPORTANCE_LOW));
             }
             b = new Notification.Builder(this, CHANNEL);
         } else {
             b = new Notification.Builder(this);
         }
-        return b.setContentTitle("NodeMax")
+        PendingIntent pi = PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE);
+        return b.setContentTitle("NodeMax is sharing your internet")
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
+                .setContentIntent(pi)
                 .setOngoing(true)
                 .build();
     }

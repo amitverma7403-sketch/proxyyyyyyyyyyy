@@ -5,11 +5,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 
-/** Restarts the tunnel after the phone reboots, if it was connected before. */
+/** Reconnects after the phone restarts or the app is updated, but only if the person had left it connected. */
 public class BootReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
-        if (!Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+        String a = intent.getAction();
+        if (!Intent.ACTION_BOOT_COMPLETED.equals(a) && !Intent.ACTION_MY_PACKAGE_REPLACED.equals(a)) {
             return;
         }
         boolean enabled = context.getSharedPreferences(MainActivity.PREFS, Context.MODE_PRIVATE)
@@ -24,8 +25,8 @@ public class BootReceiver extends BroadcastReceiver {
             } else {
                 context.startService(svc);
             }
-        } catch (Exception ignored) {
-            // some phones block background starts; the user can open the app to reconnect
+        } catch (Throwable ignored) {
+            // some phones block background starts; the person can open the app to reconnect
         }
     }
 }

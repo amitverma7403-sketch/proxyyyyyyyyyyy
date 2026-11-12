@@ -1,13 +1,13 @@
 package com.nodemax.app;
 
-import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -16,15 +16,13 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.provider.MediaStore;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.InputType;
-import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.Window;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -32,19 +30,26 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.google.mlkit.vision.barcode.common.Barcode;
-import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions;
-import com.google.mlkit.vision.codescanner.GmsBarcodeScanning;
-
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.MessageDigest;
+import java.util.Locale;
 
-/** Scan the pairing QR from your dashboard (or paste the code), then tap Connect. */
+/**
+ * The whole app is three screens:
+ * 1. what NodeMax does and what it uses (the person must agree before anything else),
+ * 2. sign in or create an account with a mobile number and a password,
+ * 3. home: Connect or Disconnect, data shared, earnings, payout request, messages and account.
+ */
 public class MainActivity extends Activity {
     static final String PREFS = "node";
 
@@ -155,7 +160,8 @@ public class MainActivity extends Activity {
         }
     }
 
-    // Same palette as the web dashboard
+
+    // ------------------------------------------------------------------ look
     private static final int INK = Color.parseColor("#0A0D0F");
     private static final int PANEL = Color.parseColor("#0E1316");
     private static final int RAISE = Color.parseColor("#131A1F");
@@ -163,21 +169,35 @@ public class MainActivity extends Activity {
     private static final int TEXT = Color.parseColor("#E6EEF1");
     private static final int MUTE = Color.parseColor("#8A9AA3");
     private static final int TEAL = Color.parseColor("#46D3FF");
-    private static final int TEAL_D = Color.parseColor("#0D2A35");
+    private static final int GOOD = Color.parseColor("#3ECF8E");
     private static final int WARN = Color.parseColor("#F2B84B");
     private static final int BAD = Color.parseColor("#EF6B6B");
 
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private TextView statusView, detailView, warnView, ipView, netView, pairedView;
-    private View statusDot, warnCard, codeBox, crashCard;
-    private TextView crashView;
-    private EditText codeInput;
-    private Button connectButton;
+    private SharedPreferences sp;
+    private LinearLayout page;
+    private String screen = "";
+    private boolean signUp = false;
+    private boolean busy = false;
+    private long lastMe = 0;
+    private JSONObject me = null;
+    private int ratePaise = 1500;
+
+    // home screen views, filled by refresh()
+    private TextView statusView, detailView, balanceView, todayView, totalView, rateView, payoutHint, warnText, acctView;
+    private View statusDot, warnCard;
+    private Button connectButton, payoutButton;
+    private LinearLayout noticeBox;
 
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
-            refresh();
+            if ("home".equals(screen)) {
+                refresh();
+                if (System.currentTimeMillis() - lastMe > 15000L) {
+                    loadMe();
+                }
+            }
             ui.postDelayed(this, 2000);
         }
     };
@@ -213,19 +233,20 @@ public class MainActivity extends Activity {
         t.setText(s);
         t.setTextSize(size);
         t.setTextColor(color);
+        t.setLineSpacing(dp(2), 1f);
         if (bold) {
             t.setTypeface(Typeface.DEFAULT_BOLD);
         }
         return t;
     }
 
-    private TextView label(String s) {
-        TextView t = text(s.toUpperCase(), 11, MUTE, true);
-        t.setLetterSpacing(0.09f);
-        return t;
+    private View gap(int h) {
+        View v = new View(this);
+        v.setLayoutParams(new LinearLayout.LayoutParams(1, dp(h)));
+        return v;
     }
 
-    /** Filled teal, outlined, or outlined-red button. */
+    /** kind 0 = filled, 1 = outlined, 2 = outlined red. */
     private Button button(String s, int kind) {
         Button b = new Button(this);
         b.setAllCaps(false);
@@ -235,353 +256,223 @@ public class MainActivity extends Activity {
         b.setStateListAnimator(null);
         b.setPadding(dp(16), 0, dp(16), 0);
         styleButton(b, kind);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
         lp.topMargin = dp(10);
         b.setLayoutParams(lp);
         return b;
     }
 
     private void styleButton(Button b, int kind) {
-        if (kind == 0) {            // primary
+        if (kind == 0) {
             b.setBackground(shape(TEAL, 0, 14));
             b.setTextColor(Color.parseColor("#04212B"));
-        } else if (kind == 1) {     // secondary
+        } else if (kind == 1) {
             b.setBackground(shape(RAISE, LINE, 14));
             b.setTextColor(TEXT);
-        } else {                    // danger
+        } else {
             b.setBackground(shape(Color.parseColor("#2A1618"), Color.parseColor("#5A2A2A"), 14));
             b.setTextColor(BAD);
         }
+    }
+
+    private EditText field(String hint, int inputType) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setHintTextColor(MUTE);
+        e.setTextColor(TEXT);
+        e.setTextSize(16);
+        e.setSingleLine(true);
+        e.setInputType(inputType);
+        e.setBackground(shape(INK, LINE, 12));
+        e.setPadding(dp(14), dp(13), dp(14), dp(13));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(10);
+        e.setLayoutParams(lp);
+        return e;
     }
 
     private LinearLayout tile(String name, TextView value) {
         LinearLayout t = new LinearLayout(this);
         t.setOrientation(LinearLayout.VERTICAL);
         t.setBackground(shape(RAISE, LINE, 14));
-        t.setPadding(dp(14), dp(12), dp(14), dp(12));
-        t.addView(label(name));
-        value.setTextSize(17);
+        t.setPadding(dp(12), dp(10), dp(12), dp(12));
+        t.addView(text(name, 12, MUTE, false));
+        value.setTextSize(16);
         value.setTextColor(TEXT);
         value.setTypeface(Typeface.DEFAULT_BOLD);
-        value.setPadding(0, dp(4), 0, 0);
-        value.setSingleLine(true);
+        value.setPadding(0, dp(3), 0, 0);
         t.addView(value);
         return t;
     }
 
+    private static String rupees(long paise) {
+        return "₹" + String.format(Locale.US, "%.2f", paise / 100.0);
+    }
+
+    private static String data(long bytes) {
+        if (bytes >= 1000000000L) {
+            return String.format(Locale.US, "%.2f GB", bytes / 1e9);
+        }
+        return String.format(Locale.US, "%.1f MB", bytes / 1e6);
+    }
+
+    private void toast(String s) {
+        Toast.makeText(this, s, Toast.LENGTH_LONG).show();
+    }
+
+    // ------------------------------------------------------------- server calls
+    interface Done {
+        void ok(JSONObject r);
+
+        void fail(int code, String msg);
+    }
+
+    /** One JSON request to the NodeMax server, off the main thread. The answer comes back on the main thread. */
+    private void api(final String method, final String path, final JSONObject body, final Done cb) {
+        final String token = sp.getString("mtoken", "");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                int code = 0;
+                String msg;
+                JSONObject out = null;
+                try {
+                    HttpURLConnection c = (HttpURLConnection) new URL(App.SERVER + path).openConnection();
+                    c.setRequestMethod(method);
+                    c.setConnectTimeout(12000);
+                    c.setReadTimeout(25000);
+                    if (token.length() > 0) {
+                        c.setRequestProperty("Authorization", "Bearer " + token);
+                    }
+                    if (body != null) {
+                        c.setDoOutput(true);
+                        c.setRequestProperty("Content-Type", "application/json");
+                        OutputStream os = c.getOutputStream();
+                        try {
+                            os.write(body.toString().getBytes("UTF-8"));
+                        } finally {
+                            os.close();
+                        }
+                    }
+                    code = c.getResponseCode();
+                    java.io.InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                    String raw = in == null ? "" : FrpcService.readAll(in);
+                    if (code >= 400) {
+                        msg = "The server answered with an error (" + code + "). Try again.";
+                        try {
+                            Object d = new JSONObject(raw).opt("detail");
+                            if (d instanceof String) {
+                                msg = (String) d;
+                                msg = msg.substring(0, 1).toUpperCase(Locale.US) + msg.substring(1);
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    } else {
+                        msg = null;
+                        out = raw.trim().startsWith("{") ? new JSONObject(raw) : new JSONObject().put("list", new JSONArray(raw));
+                    }
+                } catch (Exception e) {
+                    msg = "Could not reach NodeMax. Check your internet and try again.";
+                }
+                final int fc = code;
+                final String fm = msg;
+                final JSONObject fo = out;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isFinishing()) {
+                            return;
+                        }
+                        if (fm == null) {
+                            cb.ok(fo);
+                        } else {
+                            cb.fail(fc, fm);
+                        }
+                    }
+                });
+            }
+        }, "api").start();
+    }
+
+    /** A stable id for this phone and this app only. It limits how many accounts one phone can make. */
+    private String deviceUid() {
+        try {
+            String id = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+            byte[] h = MessageDigest.getInstance("SHA-256").digest(("nodemax:" + id).getBytes("UTF-8"));
+            StringBuilder b = new StringBuilder();
+            for (int i = 0; i < 16; i++) {
+                b.append(String.format(Locale.US, "%02x", h[i]));
+            }
+            return b.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    // ------------------------------------------------------------------ start
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         installCrashLog(this);
+        sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        getWindow().setStatusBarColor(INK);
+        getWindow().setNavigationBarColor(INK);
 
-        Window w = getWindow();
-        w.setStatusBarColor(INK);
-        w.setNavigationBarColor(INK);
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(INK);
-        root.setPadding(dp(18), dp(28), dp(18), dp(28));
-
-        // ---- header
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.VERTICAL);
-        head.addView(text("NodeMax", 26, TEXT, true));
-        TextView sub = text("Share this phone's mobile connection with your gateway.", 13, MUTE, false);
-        sub.setPadding(0, dp(2), 0, dp(6));
-        head.addView(sub);
-        root.addView(head);
-
-        // ---- shown only if the app crashed last time
-        crashCard = card();
-        crashCard.setBackground(shape(Color.parseColor("#2A1618"), Color.parseColor("#5A2A2A"), 14));
-        ((LinearLayout) crashCard).addView(text("The app crashed last time", 16, BAD, true));
-        crashView = text("", 11, TEXT, false);
-        crashView.setTypeface(Typeface.MONOSPACE);
-        crashView.setPadding(0, dp(6), 0, 0);
-        ((LinearLayout) crashCard).addView(crashView);
-        Button copyCrash = button("Copy crash details", 1);
-        copyCrash.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                copyText("NodeMax crash", diagnostics());
-            }
-        });
-        ((LinearLayout) crashCard).addView(copyCrash);
-        Button dismissCrash = button("Dismiss", 1);
-        dismissCrash.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                new File(getFilesDir(), "crash.txt").delete();
-                crashCard.setVisibility(View.GONE);
-            }
-        });
-        ((LinearLayout) crashCard).addView(dismissCrash);
-        crashCard.setVisibility(View.GONE);
-        root.addView(crashCard);
-
-        // ---- status card
-        LinearLayout status = card();
-        LinearLayout statusRow = new LinearLayout(this);
-        statusRow.setOrientation(LinearLayout.HORIZONTAL);
-        statusRow.setGravity(Gravity.CENTER_VERTICAL);
-        statusDot = new View(this);
-        statusDot.setLayoutParams(new LinearLayout.LayoutParams(dp(12), dp(12)));
-        statusRow.addView(statusDot);
-        statusView = text("", 22, TEXT, true);
-        statusView.setPadding(dp(10), 0, 0, 0);
-        statusRow.addView(statusView);
-        status.addView(statusRow);
-
-        detailView = text("", 13, MUTE, false);
-        detailView.setPadding(0, dp(6), 0, dp(12));
-        status.addView(detailView);
-
-        LinearLayout tiles = new LinearLayout(this);
-        tiles.setOrientation(LinearLayout.HORIZONTAL);
-        ipView = new TextView(this);
-        netView = new TextView(this);
-        LinearLayout t1 = tile("Public IP", ipView);
-        LinearLayout t2 = tile("Network", netView);
-        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        half.rightMargin = dp(5);
-        LinearLayout.LayoutParams half2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        half2.leftMargin = dp(5);
-        tiles.addView(t1, half);
-        tiles.addView(t2, half2);
-        status.addView(tiles);
-
-        connectButton = button("Connect", 0);
-        connectButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                toggle();
-            }
-        });
-        status.addView(connectButton);
-        root.addView(status);
-
-        // ---- wi-fi warning
-        warnCard = card();
-        warnCard.setBackground(shape(Color.parseColor("#2B2411"), Color.parseColor("#5B4A1B"), 14));
-        warnView = text("", 13, WARN, false);
-        ((LinearLayout) warnCard).addView(warnView);
-        warnCard.setVisibility(View.GONE);
-        root.addView(warnCard);
-
-        // ---- pairing card
-        LinearLayout pair = card();
-        pair.addView(text("Pair this phone", 17, TEXT, true));
-        pairedView = text("", 13, MUTE, false);
-        pairedView.setPadding(0, dp(2), 0, 0);
-        pair.addView(pairedView);
-
-        Button scan = button("Scan QR code", 0);
-        scan.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                scanQr();  // Google's scanner brings its own camera screen, so no permission is needed here
-            }
-        });
-        pair.addView(scan);
-
-        Button cam = button("Scan with the camera app", 1);
-        cam.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                openCameraApp();
-            }
-        });
-        pair.addView(cam);
-
-        Button paste = button("Paste code instead", 1);
-        paste.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                codeBox.setVisibility(View.VISIBLE);
-                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip().getItemCount() > 0) {
-                    CharSequence t = cm.getPrimaryClip().getItemAt(0).getText();
-                    if (t != null && t.toString().trim().startsWith("NC1.")) {
-                        codeInput.setText(t.toString().trim());
-                    }
-                }
-            }
-        });
-        pair.addView(paste);
-
-        codeBox = new LinearLayout(this);
-        ((LinearLayout) codeBox).setOrientation(LinearLayout.VERTICAL);
-        codeInput = new EditText(this);
-        codeInput.setTextColor(TEXT);
-        codeInput.setHintTextColor(MUTE);
-        codeInput.setHint("NC1....");
-        codeInput.setTextSize(12);
-        codeInput.setTypeface(Typeface.MONOSPACE);
-        codeInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        codeInput.setMinLines(3);
-        codeInput.setGravity(Gravity.TOP);
-        codeInput.setBackground(shape(INK, LINE, 12));
-        codeInput.setPadding(dp(12), dp(12), dp(12), dp(12));
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        clp.topMargin = dp(10);
-        ((LinearLayout) codeBox).addView(codeInput, clp);
-        Button use = button("Use this code", 1);
-        use.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                savePairing(codeInput.getText().toString().trim(), false);
-            }
-        });
-        ((LinearLayout) codeBox).addView(use);
-        codeBox.setVisibility(View.GONE);
-        pair.addView(codeBox);
-        root.addView(pair);
-
-        // ---- keep alive
-        LinearLayout keep = card();
-        keep.addView(text("Keep it running", 17, TEXT, true));
-        TextView tip = text("Turn Wi-Fi off so traffic uses mobile data. Keep the phone charging and let this app run in the background.", 13, MUTE, false);
-        tip.setPadding(0, dp(4), 0, 0);
-        keep.addView(tip);
-        Button battery = button("Allow background running", 1);
-        battery.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                askBatteryExemption();
-            }
-        });
-        keep.addView(battery);
-        root.addView(keep);
-
-        // ---- diagnostics
-        LinearLayout diag = card();
-        diag.addView(text("Something not working?", 17, TEXT, true));
-        TextView dtip = text("Copy the diagnostics and send them over. They hold the app version, phone model, status, recent errors and any crash. They do not hold your pairing code.", 13, MUTE, false);
-        dtip.setPadding(0, dp(4), 0, 0);
-        diag.addView(dtip);
-        Button copyDiag = button("Copy diagnostics", 1);
-        copyDiag.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                copyText("NodeMax diagnostics", diagnostics());
-            }
-        });
-        diag.addView(copyDiag);
-        TextView ver = text("Version " + appVersion(this), 12, MUTE, false);
-        ver.setPadding(0, dp(10), 0, 0);
-        diag.addView(ver);
-        root.addView(diag);
-
-        ScrollView scroll = new ScrollView(this);
+        final ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(INK);
         scroll.setFillViewport(true);
-        scroll.addView(root);
+        page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(dp(18), dp(18), dp(18), dp(28));
+        scroll.addView(page);
+        // Android 15 draws apps behind the status and navigation bars: keep the content clear of them
+        scroll.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+            @Override
+            public WindowInsets onApplyWindowInsets(View v, WindowInsets in) {
+                int top, bottom;
+                if (Build.VERSION.SDK_INT >= 30) {
+                    android.graphics.Insets s = in.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime());
+                    top = s.top;
+                    bottom = s.bottom;
+                } else {
+                    top = in.getSystemWindowInsetTop();
+                    bottom = in.getSystemWindowInsetBottom();
+                }
+                v.setPadding(0, top, 0, bottom);
+                return in;
+            }
+        });
         setContentView(scroll);
 
-        askAllPermissions();
-
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        if (sp.getString("code", "").length() > 0) {
-            codeInput.setText(sp.getString("code", ""));
-        }
-        handleIntent(getIntent());
-    }
-
-    private boolean has(String perm) {
-        return Build.VERSION.SDK_INT < 23 || checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED;
-    }
-
-    /** Camera (for scanning) and notifications, then the battery exemption that keeps the tunnel alive. */
-    private void askAllPermissions() {
-        java.util.ArrayList<String> need = new java.util.ArrayList<String>();
-        if (!has(Manifest.permission.CAMERA)) {
-            need.add(Manifest.permission.CAMERA);
-        }
-        if (Build.VERSION.SDK_INT >= 33 && !has("android.permission.POST_NOTIFICATIONS")) {
-            need.add("android.permission.POST_NOTIFICATIONS");
-        }
-        if (Build.VERSION.SDK_INT >= 23 && !need.isEmpty()) {
-            requestPermissions(need.toArray(new String[0]), 1);
+        if (!sp.getBoolean("agreed", false)) {
+            showIntro();
+        } else if (sp.getString("mtoken", "").length() == 0) {
+            showAuth();
         } else {
-            askBatteryOnce();
+            showHome();
         }
-    }
+        api("GET", "/app/api/config", null, new Done() {
+            @Override
+            public void ok(JSONObject r) {
+                ratePaise = r.optInt("rate_paise", ratePaise);
+                sp.edit().putInt("rate_paise", ratePaise).putBoolean("signup_open", r.optBoolean("signup", true)).apply();
+            }
 
-    private void askBatteryOnce() {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        if (!sp.getBoolean("asked_battery", false)) {
-            sp.edit().putBoolean("asked_battery", true).apply();
-            askBatteryExemption();
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
-        super.onRequestPermissionsResult(code, perms, results);
-        askBatteryOnce();
-    }
-
-    /** Open the phone's own camera: scanning the dashboard QR there opens this app by itself. */
-    private void openCameraApp() {
-        try {
-            startActivity(new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA));
-            Toast.makeText(this, "Point the camera at the QR, then tap the link that appears", Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "No camera app found. Paste the code instead.", Toast.LENGTH_LONG).show();
-        }
-    }
-
-    private void handleIntent(Intent in) {
-        if (in == null || in.getData() == null) {
-            return;
-        }
-        Uri u = in.getData();
-        if (("nodemax".equals(u.getScheme()) || "nodeconsole".equals(u.getScheme())) && u.getQueryParameter("c") != null) {
-            in.setData(null);
-            confirmPairing(u.getQueryParameter("c"), true);
-        }
-    }
-
-    @Override
-    protected void onNewIntent(Intent in) {
-        super.onNewIntent(in);
-        setIntent(in);
-        handleIntent(in);
-    }
-
-    /** Google's code scanner runs inside Play Services: no camera permission or extra screen of ours. */
-    private void scanQr() {
-        try {
-            GmsBarcodeScannerOptions opts = new GmsBarcodeScannerOptions.Builder()
-                    .setBarcodeFormats(Barcode.FORMAT_QR_CODE).build();
-            GmsBarcodeScanning.getClient(this, opts).startScan()
-                    .addOnSuccessListener(barcode -> {
-                        String v = barcode.getRawValue();
-                        if (v != null) {
-                            confirmPairing(v.trim(), true);
-                        }
-                    })
-                    .addOnFailureListener(e -> scannerUnavailable(e));
-        } catch (Throwable t) {
-            scannerUnavailable(t);
-        }
-    }
-
-    private void scannerUnavailable(Throwable e) {
-        note(this, "scanner: " + e);
-        codeBox.setVisibility(View.VISIBLE);
-        String why = e == null || e.getMessage() == null ? "" : " (" + e.getMessage() + ")";
-        Toast.makeText(this, "Scanner failed" + why + ". Use the camera app or paste the code.", Toast.LENGTH_LONG).show();
+            @Override
+            public void fail(int code, String msg) {
+            }
+        });
+        ratePaise = sp.getInt("rate_paise", 1500);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        ui.removeCallbacks(tick);
         ui.post(tick);
+        if ("home".equals(screen)) {
+            loadMe();
+        }
     }
 
     @Override
@@ -590,217 +481,578 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
-    private boolean mobileDataOn() {
-        try {
-            return Settings.Global.getInt(getContentResolver(), "mobile_data", 1) == 1;
-        } catch (Exception e) {
-            return true;
+    private void header(String title, String sub) {
+        page.removeAllViews();
+        TextView brand = text("NodeMax", 15, TEAL, true);
+        page.addView(brand);
+        TextView h = text(title, 26, TEXT, true);
+        h.setPadding(0, dp(6), 0, 0);
+        page.addView(h);
+        if (sub != null) {
+            TextView s = text(sub, 15, MUTE, false);
+            s.setPadding(0, dp(6), 0, 0);
+            page.addView(s);
         }
+    }
+
+    private void openUrl(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (Exception e) {
+            toast("No browser found to open " + url);
+        }
+    }
+
+    // ------------------------------------------------------- 1. what this app does
+    private void showIntro() {
+        screen = "intro";
+        header("Earn from your unused internet", "Read this first. It says exactly what the app does.");
+        LinearLayout c = card();
+        String rate = "₹" + (ratePaise / 100);
+        String[] points = {
+                "When you tap Connect, NodeMax sends other customers' internet traffic through this phone. It leaves from your IP address.",
+                "This uses your mobile data or Wi-Fi. You earn " + rate + " for every GB your phone carries.",
+                "You are in control. Tap Disconnect at any time and nothing runs.",
+                "Banking, payment and adult sites are blocked on the network.",
+                "To run the service the app sends NodeMax your phone model, Android version, battery level, network type, carrier and IP address.",
+                "The app does not read your contacts, messages, photos, files or location."};
+        for (String p : points) {
+            TextView t = text("•  " + p, 15, TEXT, false);
+            t.setPadding(0, dp(7), 0, dp(7));
+            c.addView(t);
+        }
+        page.addView(c);
+        Button agree = button("I agree, continue", 0);
+        agree.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                sp.edit().putBoolean("agreed", true).apply();
+                showAuth();
+            }
+        });
+        page.addView(agree);
+        Button pol = button("Read the privacy policy", 1);
+        pol.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUrl(App.SERVER + "/privacy");
+            }
+        });
+        page.addView(pol);
+    }
+
+    // ------------------------------------------------------- 2. sign in / create account
+    private void showAuth() {
+        screen = "auth";
+        header(signUp ? "Create your account" : "Sign in", signUp ? "Your mobile number is your login. No OTP needed." : "Use your mobile number and password.");
+        LinearLayout c = card();
+        final EditText name = field("Your name", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PERSON_NAME | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        final EditText phone = field("Mobile number (10 digits)", InputType.TYPE_CLASS_PHONE);
+        final EditText pass = field(signUp ? "Choose a password (6 or more characters)" : "Password", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        if (signUp) {
+            c.addView(name);
+        }
+        c.addView(phone);
+        c.addView(pass);
+        final TextView err = text("", 14, BAD, false);
+        err.setPadding(0, dp(10), 0, 0);
+        c.addView(err);
+        final Button go = button(signUp ? "Create account" : "Sign in", 0);
+        c.addView(go);
+        page.addView(c);
+        go.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (busy) {
+                    return;
+                }
+                err.setText("");
+                JSONObject b = new JSONObject();
+                try {
+                    b.put("phone", phone.getText().toString().trim());
+                    b.put("password", pass.getText().toString());
+                    b.put("name", name.getText().toString().trim());
+                    b.put("device_uid", deviceUid());
+                } catch (Exception ignored) {
+                }
+                busy = true;
+                go.setText("Please wait...");
+                api("POST", signUp ? "/app/api/signup" : "/app/api/login", b, new Done() {
+                    @Override
+                    public void ok(JSONObject r) {
+                        busy = false;
+                        sp.edit().putString("mtoken", r.optString("token")).apply();
+                        showHome();
+                    }
+
+                    @Override
+                    public void fail(int code, String msg) {
+                        busy = false;
+                        go.setText(signUp ? "Create account" : "Sign in");
+                        err.setText(msg);
+                    }
+                });
+            }
+        });
+        Button other = button(signUp ? "I already have an account" : "Create a new account", 1);
+        other.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                signUp = !signUp;
+                showAuth();
+            }
+        });
+        if (signUp || sp.getBoolean("signup_open", true)) {
+            page.addView(other);
+        }
+    }
+
+    // ------------------------------------------------------- 3. home
+    private void showHome() {
+        screen = "home";
+        header("Share and earn", null);
+
+        // connect
+        LinearLayout c = card();
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        statusDot = new View(this);
+        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(dp(10), dp(10));
+        dl.rightMargin = dp(10);
+        statusDot.setLayoutParams(dl);
+        row.addView(statusDot);
+        statusView = text("Not connected", 19, TEXT, true);
+        row.addView(statusView);
+        c.addView(row);
+        detailView = text("", 14, MUTE, false);
+        detailView.setPadding(0, dp(6), 0, dp(4));
+        c.addView(detailView);
+        connectButton = button("Connect", 0);
+        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58));
+        bl.topMargin = dp(10);
+        connectButton.setLayoutParams(bl);
+        connectButton.setTextSize(17);
+        connectButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggle();
+            }
+        });
+        c.addView(connectButton);
+        page.addView(c);
+
+        // something needs fixing
+        LinearLayout w = card();
+        w.setBackground(shape(Color.parseColor("#231C0C"), Color.parseColor("#5A4A1E"), 18));
+        warnText = text("", 14, WARN, false);
+        w.addView(warnText);
+        Button fix = button("Open battery settings", 1);
+        fix.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openBatterySettings();
+            }
+        });
+        w.addView(fix);
+        warnCard = w;
+        page.addView(w);
+
+        // earnings
+        LinearLayout e = card();
+        e.addView(text("Your balance", 13, MUTE, false));
+        balanceView = text("₹0.00", 36, TEXT, true);
+        e.addView(balanceView);
+        LinearLayout tiles = new LinearLayout(this);
+        tiles.setPadding(0, dp(10), 0, 0);
+        todayView = new TextView(this);
+        totalView = new TextView(this);
+        rateView = new TextView(this);
+        String[] names = {"Today", "Total shared", "You earn"};
+        TextView[] vals = {todayView, totalView, rateView};
+        for (int i = 0; i < 3; i++) {
+            LinearLayout t = tile(names[i], vals[i]);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            if (i > 0) {
+                lp.leftMargin = dp(8);
+            }
+            t.setLayoutParams(lp);
+            tiles.addView(t);
+        }
+        e.addView(tiles);
+        payoutHint = text("", 14, MUTE, false);
+        payoutHint.setPadding(0, dp(12), 0, 0);
+        e.addView(payoutHint);
+        payoutButton = button("Request payout", 0);
+        payoutButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                payoutDialog();
+            }
+        });
+        e.addView(payoutButton);
+        page.addView(e);
+
+        // messages
+        LinearLayout n = card();
+        n.addView(text("Messages", 16, TEXT, true));
+        noticeBox = new LinearLayout(this);
+        noticeBox.setOrientation(LinearLayout.VERTICAL);
+        n.addView(noticeBox);
+        page.addView(n);
+
+        // account
+        LinearLayout a = card();
+        a.addView(text("Account", 16, TEXT, true));
+        acctView = text("", 14, MUTE, false);
+        acctView.setPadding(0, dp(6), 0, 0);
+        a.addView(acctView);
+        Button pol = button("Privacy policy", 1);
+        pol.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUrl(App.SERVER + "/privacy");
+            }
+        });
+        a.addView(pol);
+        Button diag = button("Copy details for support", 1);
+        diag.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                if (cm != null) {
+                    cm.setPrimaryClip(ClipData.newPlainText("NodeMax details", diagnostics()));
+                    toast("Copied. Paste it in your message to support.");
+                }
+            }
+        });
+        a.addView(diag);
+        Button out = button("Sign out", 1);
+        out.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                api("POST", "/app/api/logout", new JSONObject(), new Done() {
+                    @Override
+                    public void ok(JSONObject r) {
+                    }
+
+                    @Override
+                    public void fail(int code, String msg) {
+                    }
+                });
+                signOutLocal();
+            }
+        });
+        a.addView(out);
+        Button del = button("Delete my account", 2);
+        del.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                deleteDialog();
+            }
+        });
+        a.addView(del);
+        page.addView(a);
+
+        me = null;
+        refresh();
+        loadMe();
     }
 
     private boolean enabled() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("enabled", false);
+        return sp.getBoolean("enabled", false);
     }
 
-    /** A scan or a link can come from anywhere, so say where it points before this phone joins it. */
-    private void confirmPairing(final String code, final boolean connectNow) {
-        String host;
-        try {
-            String c = code;
-            if (c.startsWith("nodemax://") || c.startsWith("nodeconsole://")) {
-                c = Uri.parse(c).getQueryParameter("c");
-            }
-            Uri pu = Uri.parse(decode(c).getString("p"));
-            if (!"https".equals(pu.getScheme())) {
-                Toast.makeText(this, "This pairing code uses an unencrypted address. Create a new one in the dashboard.", Toast.LENGTH_LONG).show();
-                return;
-            }
-            host = pu.getHost() + (pu.getPort() > 0 ? ":" + pu.getPort() : "");
-        } catch (Exception e) {
-            Toast.makeText(this, "That is not a pairing code from your dashboard", Toast.LENGTH_LONG).show();
+    /** Fills the home screen from what the service and the server last said. */
+    private void refresh() {
+        if (!"home".equals(screen) || statusView == null) {
             return;
         }
-        new AlertDialog.Builder(this)
-                .setTitle("Pair this phone?")
-                .setMessage("It will share its mobile connection with the panel at\n\n" + host
-                        + (enabled() ? "\n\nThis replaces the current pairing." : ""))
-                .setPositiveButton("Pair", new android.content.DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(android.content.DialogInterface d, int w) {
-                        savePairing(code, connectNow);
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void copyText(String label, String s) {
-        try {
-            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-            cm.setPrimaryClip(android.content.ClipData.newPlainText(label, s));
-            Toast.makeText(this, "Copied. Paste it into your message.", Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "Could not copy", Toast.LENGTH_LONG).show();
+        boolean on = enabled();
+        String st = FrpcService.status;
+        boolean live = on && "Connected".equals(st);
+        statusView.setText(!on ? "Not connected" : live ? "Connected" : st.startsWith("Stopped") ? "Connecting..." : st);
+        statusDot.setBackground(shape(live ? GOOD : on ? WARN : MUTE, 0, 5));
+        detailView.setText(!on ? "Tap Connect to start sharing and earning."
+                : live ? "Sharing through " + FrpcService.networkType + ", IP " + FrpcService.publicIp + ". Keep this on to earn."
+                : "Trying to reach NodeMax...");
+        if (!busy) {
+            connectButton.setText(on ? "Disconnect" : "Connect");
+            styleButton(connectButton, on ? 1 : 0);
         }
-    }
-
-    private String diagnostics() {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        StringBuilder b = new StringBuilder();
-        b.append("NodeMax ").append(appVersion(this)).append("\n");
-        b.append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append(", Android ")
-                .append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
-        b.append("CPU: ").append(java.util.Arrays.toString(Build.SUPPORTED_ABIS)).append("\n");
-        try {
-            b.append("Google Play services: ").append(getPackageManager().getPackageInfo("com.google.android.gms", 0).versionName).append("\n");
-        } catch (Exception e) {
-            b.append("Google Play services: NOT INSTALLED\n");
-        }
-        String panel = sp.getString("panel", "");
-        Uri pu = Uri.parse(panel);
-        b.append("Panel: ").append(panel.length() == 0 ? "not paired" : pu.getHost() + (pu.getPort() > 0 ? ":" + pu.getPort() : "")).append("\n");
-        b.append("Connected: ").append(enabled()).append(", status: ").append(FrpcService.status).append("\n");
-        b.append("Tunnel log: ").append(FrpcService.lastLog).append("\n");
-        b.append("Root: ").append(FrpcService.rooted).append(", network: ").append(FrpcService.networkType)
-                .append(", IP: ").append(FrpcService.publicIp).append("\n");
-        b.append("Internet check: ").append(FrpcService.selfTest.length() == 0 ? "not run yet" : FrpcService.selfTest).append("\n");
-        b.append("Camera permission: ").append(has(Manifest.permission.CAMERA)).append(", notifications: ")
-                .append(Build.VERSION.SDK_INT < 33 || has("android.permission.POST_NOTIFICATIONS")).append("\n");
+        boolean batteryFree = true;
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            b.append("Battery optimisation off: ").append(pm.isIgnoringBatteryOptimizations(getPackageName())).append("\n");
-        } catch (Exception ignored) {
+            batteryFree = pm == null || pm.isIgnoringBatteryOptimizations(getPackageName());
+        } catch (Throwable ignored) {
         }
-        String log = readText(new File(getFilesDir(), "app.log"));
-        if (log != null && log.length() > 0) {
-            b.append("\n--- recent events ---\n").append(log.length() > 3000 ? log.substring(log.length() - 3000) : log);
+        warnCard.setVisibility(on && !batteryFree ? View.VISIBLE : View.GONE);
+        warnText.setText("Your phone may stop NodeMax when the screen is locked, and you stop earning. "
+                + "Open battery settings, find NodeMax and choose \"Don't optimise\" or \"No restrictions\".");
+        if (me == null) {
+            return;
         }
-        String crash = crashText(this);
-        if (crash != null) {
-            b.append("\n--- last crash ---\n").append(crash);
-        }
-        return b.toString();
-    }
-
-    /** Validate and store a pairing code; optionally connect straight away (after a scan). */
-    private void savePairing(String code, boolean connectNow) {
-        try {
-            if (code.startsWith("nodemax://") || code.startsWith("nodeconsole://")) {
-                code = Uri.parse(code).getQueryParameter("c");
-            }
-            JSONObject o = decode(code);
-            String panel = o.getString("p");
-            String token = o.getString("t");
-            boolean was = enabled();
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putString("code", code).putString("panel", panel).putString("token", token).apply();
-            codeInput.setText(code);
-            Toast.makeText(this, "Phone paired", Toast.LENGTH_SHORT).show();
-            if (was) {
-                stopService(new Intent(this, FrpcService.class));  // restart with the new pairing
-            }
-            if (connectNow || was) {
-                startTunnel();
-            }
-        } catch (Exception e) {
-            Toast.makeText(this, "That is not a pairing code from your dashboard", Toast.LENGTH_LONG).show();
-        }
-        refresh();
-    }
-
-    private void startTunnel() {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("enabled", true).apply();
-        Intent svc = new Intent(this, FrpcService.class);
-        if (Build.VERSION.SDK_INT >= 26) {
-            startForegroundService(svc);
+        balanceView.setText(rupees(me.optLong("balance_paise")));
+        todayView.setText(data(me.optLong("bytes_today")));
+        totalView.setText(data(me.optLong("bytes_total")));
+        rateView.setText("₹" + (me.optInt("rate_paise", ratePaise) / 100) + " per GB");
+        JSONObject pend = me.optJSONObject("pending");
+        boolean can = me.optBoolean("can_payout");
+        if (pend != null) {
+            payoutHint.setText(rupees(pend.optLong("amount_paise")) + " requested to " + pend.optString("upi") + ". " + me.optString("payout_note"));
+            payoutHint.setTextColor(GOOD);
         } else {
-            startService(svc);
+            payoutHint.setText(can ? "You can ask for your payout now." : me.optString("payout_hint"));
+            payoutHint.setTextColor(MUTE);
+        }
+        payoutButton.setVisibility(pend == null ? View.VISIBLE : View.GONE);
+        payoutButton.setEnabled(can);
+        payoutButton.setAlpha(can ? 1f : 0.45f);
+        String nm = me.optString("name", "");
+        acctView.setText((nm.length() > 0 && !"null".equals(nm) ? nm + ", " : "") + "+91 " + me.optString("phone")
+                + "\nPaid so far: " + rupees(me.optLong("paid_paise")) + "\nApp version " + appVersion(this));
+        noticeBox.removeAllViews();
+        JSONArray ns = me.optJSONArray("notices");
+        if (ns == null || ns.length() == 0) {
+            TextView t = text("No messages yet.", 14, MUTE, false);
+            t.setPadding(0, dp(8), 0, 0);
+            noticeBox.addView(t);
+        }
+        for (int i = 0; ns != null && i < Math.min(5, ns.length()); i++) {
+            JSONObject o = ns.optJSONObject(i);
+            if (o == null) {
+                continue;
+            }
+            TextView t = text(o.optString("title"), 15, TEXT, true);
+            t.setPadding(0, dp(10), 0, 0);
+            noticeBox.addView(t);
+            noticeBox.addView(text(o.optString("body"), 14, MUTE, false));
         }
     }
 
+    private void loadMe() {
+        lastMe = System.currentTimeMillis();
+        api("GET", "/app/api/me", null, new Done() {
+            @Override
+            public void ok(JSONObject r) {
+                me = r;
+                Push.configure(MainActivity.this, r.optJSONObject("firebase"));
+                refresh();
+            }
+
+            @Override
+            public void fail(int code, String msg) {
+                if (code == 401 || code == 403) {
+                    toast(code == 403 ? msg : "Please sign in again.");
+                    signOutLocal();
+                }
+            }
+        });
+    }
+
+    private void signOutLocal() {
+        stopTunnel();
+        sp.edit().remove("mtoken").remove("token").apply();
+        me = null;
+        signUp = false;
+        showAuth();
+    }
+
+    // ------------------------------------------------------- connect / disconnect
     private void toggle() {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (busy) {
+            return;
+        }
         if (enabled()) {
-            sp.edit().putBoolean("enabled", false).apply();
-            stopService(new Intent(this, FrpcService.class));
+            stopTunnel();
             refresh();
             return;
         }
-        if (sp.getString("token", "").length() == 0) {
-            String typed = codeInput.getText().toString().trim();
-            if (typed.length() == 0) {
-                Toast.makeText(this, "Scan the QR code first", Toast.LENGTH_LONG).show();
-                return;
-            }
-            savePairing(typed, true);
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != 0
+                && !sp.getBoolean("asked_notify", false)) {
+            // Android shows its own question. The answer does not block connecting.
+            sp.edit().putBoolean("asked_notify", true).apply();
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 7);
             return;
         }
-        startTunnel();
-        refresh();
+        connect();
     }
 
-    private static JSONObject decode(String code) throws Exception {
-        String s = code.trim();
-        if (s.startsWith("NC1.")) {
-            s = s.substring(4);
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == 7) {
+            connect();
         }
-        while (s.length() % 4 != 0) {
-            s = s + "=";
-        }
-        byte[] raw = Base64.decode(s, Base64.URL_SAFE);
-        return new JSONObject(new String(raw, "UTF-8"));
     }
 
-    private void askBatteryExemption() {
+    private void connect() {
+        busy = true;
+        connectButton.setText("Connecting...");
+        JSONObject b = new JSONObject();
+        try {
+            b.put("device_uid", deviceUid());
+            b.put("model", Build.MANUFACTURER + " " + Build.MODEL);
+            b.put("android", Build.VERSION.RELEASE);
+        } catch (Exception ignored) {
+        }
+        api("POST", "/app/api/connect", b, new Done() {
+            @Override
+            public void ok(JSONObject r) {
+                busy = false;
+                String panel = r.optString("panel", "");
+                sp.edit().putString("panel", panel.length() > 0 ? panel : App.SERVER).putString("token", r.optString("token"))
+                        .putBoolean("enabled", true).apply();
+                try {
+                    Intent svc = new Intent(MainActivity.this, FrpcService.class);
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        startForegroundService(svc);
+                    } else {
+                        startService(svc);
+                    }
+                } catch (Throwable e) {
+                    note(MainActivity.this, "start service: " + e);
+                    sp.edit().putBoolean("enabled", false).apply();
+                    toast("Android did not let the app start sharing. Try again.");
+                }
+                refresh();
+            }
+
+            @Override
+            public void fail(int code, String msg) {
+                busy = false;
+                toast(msg);
+                if (code == 401) {
+                    signOutLocal();
+                } else {
+                    refresh();
+                }
+            }
+        });
+    }
+
+    private void stopTunnel() {
+        sp.edit().putBoolean("enabled", false).apply();
+        try {
+            stopService(new Intent(this, FrpcService.class));
+        } catch (Throwable ignored) {
+        }
+        FrpcService.status = "Stopped";
+    }
+
+    private void openBatterySettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        } catch (Throwable e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // ------------------------------------------------------- payout and account dialogs
+    private LinearLayout dialogBox() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(22), dp(6), dp(22), 0);
+        return box;
+    }
+
+    private void payoutDialog() {
+        if (me == null) {
+            return;
+        }
+        LinearLayout box = dialogBox();
+        box.addView(text("You are asking for " + rupees(me.optLong("balance_paise")) + ". " + me.optString("payout_note"), 14, MUTE, false));
+        final EditText upi = field("UPI ID, like name@bank", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        final EditText nm = field("Name on the account (optional)", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        String old = me.optString("upi", "");
+        if (old.length() > 0 && !"null".equals(old)) {
+            upi.setText(old);
+        }
+        box.addView(upi);
+        box.addView(nm);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Request payout").setView(box)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Send request", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        JSONObject b = new JSONObject();
+                        try {
+                            b.put("upi", upi.getText().toString().trim());
+                            b.put("name", nm.getText().toString().trim());
+                        } catch (Exception ignored) {
+                        }
+                        api("POST", "/app/api/payout", b, new Done() {
+                            @Override
+                            public void ok(JSONObject r) {
+                                toast("Request sent. " + r.optString("message"));
+                                loadMe();
+                            }
+
+                            @Override
+                            public void fail(int code, String msg) {
+                                toast(msg);
+                            }
+                        });
+                    }
+                }).show();
+    }
+
+    private void deleteDialog() {
+        LinearLayout box = dialogBox();
+        box.addView(text("Your account, this phone's connection and your history are removed for good. "
+                + "Any balance you have not been paid is lost, so ask for your payout first.", 14, MUTE, false));
+        final EditText pw = field("Your password", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        box.addView(pw);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Delete my account").setView(box)
+                .setNegativeButton("Keep my account", null)
+                .setPositiveButton("Delete", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        JSONObject b = new JSONObject();
+                        try {
+                            b.put("password", pw.getText().toString());
+                        } catch (Exception ignored) {
+                        }
+                        api("POST", "/app/api/delete", b, new Done() {
+                            @Override
+                            public void ok(JSONObject r) {
+                                toast("Your account was deleted.");
+                                signOutLocal();
+                            }
+
+                            @Override
+                            public void fail(int code, String msg) {
+                                toast(msg);
+                            }
+                        });
+                    }
+                }).show();
+    }
+
+    private String diagnostics() {
+        StringBuilder b = new StringBuilder();
+        b.append("NodeMax ").append(appVersion(this)).append("\n");
+        b.append("Phone: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append(", Android ").append(Build.VERSION.RELEASE).append("\n");
+        b.append("Sharing switched on: ").append(enabled()).append("\n");
+        b.append("Status: ").append(FrpcService.status).append("\n");
+        b.append("Network: ").append(FrpcService.networkType).append(", IP ").append(FrpcService.publicIp).append("\n");
+        b.append("Internet check: ").append(FrpcService.selfTest).append("\n");
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm != null && pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                Toast.makeText(this, "Already allowed", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-            i.setData(Uri.parse("package:" + getPackageName()));
-            startActivity(i);
-        } catch (Exception e) {
-            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            b.append("Battery optimisation off: ").append(pm.isIgnoringBatteryOptimizations(getPackageName())).append("\n");
+        } catch (Throwable ignored) {
         }
-    }
-
-    private void refresh() {
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        boolean paired = sp.getString("token", "").length() > 0;
-        boolean on = enabled();
-        boolean good = on && "Connected".equals(FrpcService.status);
-
-        connectButton.setText(on ? "Disconnect" : "Connect");
-        styleButton(connectButton, on ? 2 : 0);
-
-        statusView.setText(on ? FrpcService.status : "Not connected");
-        statusView.setTextColor(good ? TEAL : on ? WARN : TEXT);
-        statusDot.setBackground(shape(good ? TEAL : on ? WARN : MUTE, 0, 6));
-
-        if (on) {
-            detailView.setText((FrpcService.lastLog.length() > 0 ? "Tunnel: " + FrpcService.lastLog : "Starting the tunnel...")
-                    + "\nInternet check: " + (FrpcService.selfTest.length() == 0 ? "running soon" : FrpcService.selfTest)
-                    + "\nRoot: " + (FrpcService.rooted ? "yes, remote IP rotation and data control are on"
-                    : "no, remote IP rotation and data control are off"));
-        } else {
-            detailView.setText(paired ? "Ready. Tap Connect to go online." : "Scan the QR code from your dashboard to get started.");
-        }
+        b.append("Tunnel: ").append(FrpcService.lastLog).append("\n");
         String crash = crashText(this);
-        if (crash != null && crashCard.getVisibility() != View.VISIBLE) {
-            crashView.setText(crash.length() > 700 ? crash.substring(0, 700) + "..." : crash);
-            crashCard.setVisibility(View.VISIBLE);
+        if (crash != null) {
+            b.append("\nLast crash:\n").append(crash).append("\n");
         }
-        ipView.setText(on && FrpcService.publicIp != null && FrpcService.publicIp.length() > 0 ? FrpcService.publicIp : "-");
-        netView.setText(on && FrpcService.networkType != null && FrpcService.networkType.length() > 0 ? FrpcService.networkType : "-");
-
-        boolean wifi = on && "wifi".equals(FrpcService.networkType);
-        boolean dataOff = on && !mobileDataOn();
-        warnCard.setVisibility(wifi || dataOff ? View.VISIBLE : View.GONE);
-        warnView.setText(dataOff ? "Mobile data is off, so this phone cannot carry traffic. Turn it on in Settings."
-                : "This phone is on Wi-Fi, so traffic exits through Wi-Fi. Turn Wi-Fi off to use mobile data.");
-
-        pairedView.setText(paired ? "Paired. Scan a new code to switch to a different device." : "Scan the QR code shown when you add a device.");
+        String log = readText(new File(getFilesDir(), "app.log"));
+        if (log != null) {
+            b.append("\nLog:\n").append(log.length() > 3000 ? log.substring(log.length() - 3000) : log);
+        }
+        return b.toString();
     }
 }

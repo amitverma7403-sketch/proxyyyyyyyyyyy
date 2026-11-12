@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace 'com.nodemax.app'
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId 'com.nodemax.app'
         minSdk 24
-        targetSdk 34
+        targetSdk 35
         versionCode 1
         versionName '0.1.0'
         ndk {
@@ -36,7 +36,7 @@ android {
             debuggable = false
         }
         release {
-            // not debuggable: nobody can read the pairing token out of the app with adb
+            // not debuggable: nobody can read the sign-in token out of the app with adb
             debuggable = false
             minifyEnabled false  // obfuscated code is a common reason for scanners to flag an app
             signingConfig signingConfigs.release
@@ -58,6 +58,7 @@ android {
 }
 
 dependencies {
-    // QR scanner that runs inside Google Play Services
-    implementation 'com.google.android.gms:play-services-code-scanner:16.1.0'
+    // push notifications; the Firebase project settings come from the server at run time
+    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.9.24')
+    implementation 'com.google.firebase:firebase-messaging:24.1.0'
 }
