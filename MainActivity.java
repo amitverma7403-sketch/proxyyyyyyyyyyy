@@ -451,6 +451,8 @@ public class MainActivity extends Activity {
 
         if (!sp.getBoolean("agreed", false)) {
             showIntro();
+        } else if (!sp.getBoolean("perm_done", false)) {
+            showPermissions();
         } else if (sp.getString("mtoken", "").length() == 0) {
             showAuth();
         } else {
@@ -525,7 +527,8 @@ public class MainActivity extends Activity {
                 "You are in control. Tap Disconnect at any time and nothing runs.",
                 "Banking, payment and adult sites are blocked on the network.",
                 "To run the service the app sends NodeMax your phone model, Android version, battery level, network type, carrier and IP address.",
-                "The app does not read your contacts, messages, photos, files or location."};
+                "If you allow it, the app reads your approximate location (about 1 km) once an hour while sharing is on, so NodeMax knows which city and state your connection exits from. It is never tracked continuously.",
+                "The app does not read your contacts, messages, photos or files."};
         for (String p : points) {
             TextView t = text("•  " + p, 15, TEXT, false);
             t.setPadding(0, dp(7), 0, dp(7));
@@ -537,7 +540,7 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 sp.edit().putBoolean("agreed", true).apply();
-                showAuth();
+                showPermissions();
             }
         });
         page.addView(agree);
@@ -549,6 +552,65 @@ public class MainActivity extends Activity {
             }
         });
         page.addView(pol);
+    }
+
+    // ------------------------------------------------------- 1b. permissions, asked once at the start
+    private void showPermissions() {
+        screen = "perms";
+        header("Allow what the app needs", "Android asks you next. Each item is used only to run the service.");
+        LinearLayout c = card();
+        String[] points = {
+                "Notifications: the \"sharing is on\" notice while the app runs, plus your earnings and service messages.",
+                "Approximate location (optional): read once an hour while sharing is on and rounded to about 1 km, so NodeMax knows which city and state your connection exits from. Never tracked continuously.",
+                "Internet and running in the background: needed to carry traffic, and only after you tap Connect. Tap Disconnect and nothing runs."};
+        for (String p : points) {
+            TextView tv = text("•  " + p, 15, TEXT, false);
+            tv.setPadding(0, dp(7), 0, dp(7));
+            c.addView(tv);
+        }
+        page.addView(c);
+        Button allow = button("Allow and continue", 0);
+        allow.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                askAllPermissions();
+            }
+        });
+        page.addView(allow);
+        Button skip = button("Not now", 1);
+        skip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                sp.edit().putBoolean("perm_done", true).apply();
+                afterPermissions();
+            }
+        });
+        page.addView(skip);
+    }
+
+    private void askAllPermissions() {
+        sp.edit().putBoolean("perm_done", true).apply();
+        java.util.ArrayList<String> need = new java.util.ArrayList<String>();
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != 0) {
+            need.add("android.permission.POST_NOTIFICATIONS");
+            sp.edit().putBoolean("asked_notify", true).apply();
+        }
+        if (checkSelfPermission("android.permission.ACCESS_COARSE_LOCATION") != 0) {
+            need.add("android.permission.ACCESS_COARSE_LOCATION");
+        }
+        if (need.isEmpty()) {
+            afterPermissions();
+        } else {
+            requestPermissions(need.toArray(new String[0]), 8);  // Android shows its own question for each
+        }
+    }
+
+    private void afterPermissions() {
+        if (sp.getString("mtoken", "").length() == 0) {
+            showAuth();
+        } else {
+            showHome();
+        }
     }
 
     // ------------------------------------------------------- 2. sign in / create account
@@ -1039,6 +1101,8 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(code, perms, results);
         if (code == 7) {
             connect();
+        } else if (code == 8) {
+            afterPermissions();  // granted or not, the app carries on: location is optional
         }
     }
 

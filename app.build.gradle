@@ -18,6 +18,24 @@ android {
         }
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
+    // direct = the APK people download from the website (can update itself); play = the Google Play bundle
+    // (Play rules: no self-updating and no permission to install other apps)
+    flavorDimensions 'dist'
+    productFlavors {
+        direct {
+            dimension 'dist'
+            buildConfigField 'boolean', 'PLAY', 'false'
+        }
+        play {
+            dimension 'dist'
+            buildConfigField 'boolean', 'PLAY', 'true'
+        }
+    }
+
     signingConfigs {
         release {
             // one fixed signing key: phones and Play Protect trust an app that is always signed the same way

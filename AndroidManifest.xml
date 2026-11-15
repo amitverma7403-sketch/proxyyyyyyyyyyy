@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- talk to the NodeMax server and carry traffic -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -14,6 +15,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- tells 4G from 5G on Android 13+; a normal permission, no prompt, no access to calls or numbers -->
     <uses-permission android:name="android.permission.READ_BASIC_PHONE_STATE" />
+    <!-- approximate location only (about 1 km), read once an hour while sharing is on; the person can say no -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <!-- lets the direct-download copy install its own updates (the person still taps Install) -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
@@ -43,7 +47,7 @@
         <service
             android:name=".FrpcService"
             android:exported="false"
-            android:foregroundServiceType="dataSync|specialUse">
+            android:foregroundServiceType="dataSync|specialUse|location">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Shares this phone's internet connection with the NodeMax network while the user has tapped Connect, and stops when the user taps Disconnect." />

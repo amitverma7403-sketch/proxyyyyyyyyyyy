@@ -57,6 +57,9 @@ final class Updater {
 
     /** False when Google Play installed the app, because Play rules do not allow an app to update itself. */
     static boolean allowed(Context c) {
+        if (BuildConfig.PLAY) {
+            return false;  // the Google Play build never updates itself
+        }
         try {
             String src;
             if (Build.VERSION.SDK_INT >= 30) {

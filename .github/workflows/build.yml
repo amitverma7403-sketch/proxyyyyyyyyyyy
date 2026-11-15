@@ -35,11 +35,12 @@ jobs:
           mv MainActivity.java FrpcService.java BootReceiver.java App.java Push.java PushService.java Updater.java UpdateReceiver.java app/src/main/java/com/nodemax/app/
           mv network_security_config.xml data_extraction_rules.xml app/src/main/res/xml/
           mv AndroidManifest.xml app/src/main/
+          mkdir -p app/src/play && mv AndroidManifest.play.xml app/src/play/AndroidManifest.xml
           mv app.build.gradle app/build.gradle
           mkdir -p app/src/main/res/drawable
           mv ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
           echo "android.useAndroidX=true" > gradle.properties
-          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '2.1'/" app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName '0.1.0'/versionName '2.2'/" app/build.gradle
           grep -n "version" app/build.gradle
 
       - name: Download the official frp client (frpc) for Android CPUs
@@ -75,17 +76,26 @@ jobs:
           fi
           echo "KS_FILE=nodemax.jks" >> "$GITHUB_ENV"
 
-      - name: Build signed APK
+      - name: Build the signed APK (direct download) and the Google Play bundle
         run: |
-          gradle assembleRelease --no-daemon --stacktrace
-          "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          gradle assembleDirectRelease bundlePlayRelease --no-daemon --stacktrace
+          "$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner" verify --verbose app/build/outputs/apk/direct/release/app-direct-release.apk
 
-      - name: Name the APK
-        run: cp app/build/outputs/apk/release/app-release.apk NodeMax.apk
+      - name: Name the files
+        run: |
+          cp app/build/outputs/apk/direct/release/app-direct-release.apk NodeMax.apk
+          cp app/build/outputs/bundle/playRelease/app-play-release.aab NodeMax-play.aab
+
+      - name: Keep the Play bundle (Actions page, Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NodeMax-play-aab
+          path: NodeMax-play.aab
+          retention-days: 30
 
       - name: Publish to Releases (direct download link)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: NodeMax 2.1 build ${{ github.run_number }}
+          name: NodeMax 2.2 build ${{ github.run_number }}
           files: NodeMax.apk

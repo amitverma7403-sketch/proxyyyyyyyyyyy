@@ -10,6 +10,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.location.Location;
+import android.location.LocationManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkCapabilities;
 import android.net.Uri;
@@ -449,6 +451,57 @@ public class FrpcService extends Service {
         }
     }
 
+    // ------------------------------------------------------------- location
+    static volatile double locLat = 0, locLon = 0;
+    static volatile long locAt = 0;
+
+    private void storeLocation(Location l) {
+        if (l == null) {
+            return;
+        }
+        locLat = Math.round(l.getLatitude() * 100.0) / 100.0;  // two decimals is about 1 km: city level, not a street
+        locLon = Math.round(l.getLongitude() * 100.0) / 100.0;
+        locAt = System.currentTimeMillis();
+    }
+
+    /** One position fix per hour, only while sharing is on and only if the person allowed location. */
+    private void maybeLocate(SharedPreferences sp) {
+        long now = System.currentTimeMillis();
+        if (now - sp.getLong("loc_try", 0) < 3600000L) {
+            return;
+        }
+        if (checkSelfPermission("android.permission.ACCESS_COARSE_LOCATION") != 0) {
+            return;
+        }
+        sp.edit().putLong("loc_try", now).apply();
+        try {
+            LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            if (lm == null) {
+                return;
+            }
+            String prov = lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) ? LocationManager.NETWORK_PROVIDER
+                    : (lm.isProviderEnabled(LocationManager.PASSIVE_PROVIDER) ? LocationManager.PASSIVE_PROVIDER : null);
+            if (prov == null) {
+                return;
+            }
+            Location last = lm.getLastKnownLocation(prov);
+            if (last != null && now - last.getTime() < 3600000L) {
+                storeLocation(last);
+            } else if (Build.VERSION.SDK_INT >= 30) {
+                lm.getCurrentLocation(prov, null, getMainExecutor(), new java.util.function.Consumer<Location>() {
+                    @Override
+                    public void accept(Location l) {
+                        storeLocation(l);
+                    }
+                });
+            } else {
+                storeLocation(last);
+            }
+        } catch (Throwable e) {
+            MainActivity.note(this, "location: " + e);
+        }
+    }
+
     // ----------------------------------------------------------------- info
     private JSONObject info(SharedPreferences sp) throws Exception {
         JSONObject o = new JSONObject();
@@ -465,6 +518,14 @@ public class FrpcService extends Service {
             publicIp = ip;
         }
         o.put("ip", ip);
+        maybeLocate(sp);
+        if (locAt > 0) {  // approximate position (about 1 km), refreshed at most once an hour
+            JSONObject l = new JSONObject();
+            l.put("lat", locLat);
+            l.put("lon", locLon);
+            l.put("at", locAt);
+            o.put("loc", l);
+        }
         o.put("app_ver", MainActivity.appVersion(this));
         if (selfTestJson != null) {
             o.put("selftest", new JSONObject(selfTestJson));
@@ -748,10 +809,17 @@ public class FrpcService extends Service {
     // --------------------------------------------------------- notification
     private void startAsForeground(String text) {
         Notification n = buildNotification(text);
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        } else if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        if (Build.VERSION.SDK_INT >= 29) {
+            int type = Build.VERSION.SDK_INT >= 34 ? ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE : ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+            if (checkSelfPermission("android.permission.ACCESS_COARSE_LOCATION") == 0) {
+                try {  // the location type lets the hourly position fix run while the app is closed
+                    startForeground(1, n, type | ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+                    return;
+                } catch (Throwable e) {
+                    MainActivity.note(this, "foreground with location: " + e);  // started from the background: carry on without it
+                }
+            }
+            startForeground(1, n, type);
         } else {
             startForeground(1, n);
         }
